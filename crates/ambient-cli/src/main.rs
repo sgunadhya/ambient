@@ -240,7 +240,8 @@ fn run() -> Result<(), String> {
     match cli.command {
         Commands::Watch => {
             let config_path = default_config_path()?;
-            let config = AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
+            let mut config =
+                AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
 
             // Gap 4: first-run vault check — guide user through setup if no vault configured.
             if config.obsidian_vault.is_empty()
@@ -254,8 +255,17 @@ fn run() -> Result<(), String> {
                     println!("{line}");
                 }
                 eprintln!();
-                eprintln!("Edit ~/.ambient/config.toml to set obsidian_vault, then re-run `ambient watch`.");
-                return Ok(());
+
+                // Re-read config after setup
+                config = AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
+
+                if config.obsidian_vault.is_empty()
+                    || !std::path::Path::new(&config.obsidian_vault).exists()
+                {
+                    eprintln!("Setup did not configure a vault. Exiting.");
+                    return Ok(());
+                }
+                eprintln!("Setup complete! Starting daemon...");
             }
 
             let daemon_pid_path = default_daemon_pid_path()?;
