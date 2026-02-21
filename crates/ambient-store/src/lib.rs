@@ -603,6 +603,84 @@ impl CozoStore {
     }
 }
 
+/// Private helper methods for CozoStore — not part of the KnowledgeStore trait.
+impl CozoStore {
+    /// Decode a CozoDB result row `[id, source, title, content, hash, embedding, observed_at, ...]`
+    /// into a `KnowledgeUnit`. The optional trailing column (dist / score) is ignored.
+    fn row_to_knowledge_unit(&self, row: &[DataValue]) -> Option<KnowledgeUnit> {
+        if row.len() < 7 {
+            return None;
+        }
+        let id_str = match &row[0] {
+            DataValue::Str(s) => s.to_string(),
+            _ => return None,
+        };
+        let id = Uuid::parse_str(&id_str).ok()?;
+        let source = match &row[1] {
+            DataValue::Str(s) => ambient_core::SourceId(s.to_string()),
+            _ => return None,
+        };
+        let title = match &row[2] {
+            DataValue::Str(s) if !s.is_empty() => Some(s.to_string()),
+            _ => None,
+        };
+        let content = match &row[3] {
+            DataValue::Str(s) => s.to_string(),
+            _ => return None,
+        };
+        let content_hash: [u8; 32] = match &row[4] {
+            DataValue::Str(s) => {
+                let mut arr = [0u8; 32];
+                let bytes = s.as_bytes();
+                let len = bytes.len().min(32);
+                arr[..len].copy_from_slice(&bytes[..len]);
+                arr
+            }
+            _ => [0u8; 32],
+        };
+        // CozoDB Num is either Int or Float internally; convert to f32 via i64/f64 match.
+        let num_to_f32 = |v: &DataValue| -> Option<f32> {
+            match v {
+                DataValue::Num(n) => match n {
+                    cozo::Num::Int(i) => Some(*i as f32),
+                    cozo::Num::Float(f) => Some(*f as f32),
+                },
+                _ => None,
+            }
+        };
+        let embedding = match &row[5] {
+            DataValue::List(vals) => {
+                let v: Vec<f32> = vals.iter().filter_map(num_to_f32).collect();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+            _ => None,
+        };
+        let observed_at_ms: i64 = match &row[6] {
+            DataValue::Num(n) => match n {
+                cozo::Num::Int(i) => *i,
+                cozo::Num::Float(f) => *f as i64,
+            },
+            _ => return None,
+        };
+        let observed_at = chrono::DateTime::from_timestamp_millis(observed_at_ms)?;
+
+        Some(KnowledgeUnit {
+            id,
+            source,
+            title,
+            content,
+            content_hash,
+            embedding,
+            observed_at,
+            metadata: std::collections::HashMap::new(),
+        })
+    }
+}
+
 impl KnowledgeStore for CozoStore {
     fn upsert(&self, unit: KnowledgeUnit) -> Result<()> {
         // ── Deduplication ────────────────────────────────────────────────────
@@ -682,6 +760,10 @@ impl KnowledgeStore for CozoStore {
     }
 
     fn search_semantic(&self, query_vec: &[f32], k: usize) -> Result<Vec<KnowledgeUnit>> {
+        if query_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+
         let mut params = BTreeMap::new();
         params.insert(
             "vec".to_string(),
@@ -694,42 +776,75 @@ impl KnowledgeStore for CozoStore {
         );
         params.insert("k".to_string(), DataValue::from(k as i64));
 
+        // Join HNSW neighbor results with the notes relation in one Datalog statement.
+        // Per NEXT.md Amendment 1 — no in-memory cache dependency.
         let script = r#"
-?[id, dist] :=
-    ~notes:embedding_idx{ id | query: $vec, k: $k, ef: 50, bind_distance: dist }
+?[id, source, title, content, hash, embedding, observed_at, dist] :=
+    ~notes:embedding_idx{ id | query: $vec, k: $k, ef: 50, bind_distance: dist },
+    *notes{ id, source, title, content, hash, embedding, observed_at }
 :order dist
 :limit $k
 "#;
-        let mut results = Vec::new();
-        if let Ok(result) = self
+        match self
             .cozo
-            .run_script(script, params, cozo::ScriptMutability::Immutable)
+            .run_script(script, params, ScriptMutability::Immutable)
         {
-            let units_cache = self
-                .units
-                .lock()
-                .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?;
-            for row in result.rows {
-                if let Some(cozo::DataValue::Str(id_str)) = row.first() {
-                    if let Ok(id) = uuid::Uuid::parse_str(id_str.as_ref()) {
-                        if let Some(unit) = units_cache.get(&id) {
-                            results.push(unit.clone());
-                        }
-                    }
-                }
+            Ok(result) => {
+                let out = result
+                    .rows
+                    .iter()
+                    .filter_map(|row| self.row_to_knowledge_unit(row))
+                    .collect();
+                Ok(out)
+            }
+            Err(_) => {
+                // HNSW index empty or not yet built — return empty so callers fall back to FTS.
+                Ok(Vec::new())
             }
         }
-        Ok(results)
     }
 
     fn search_fulltext(&self, query: &str) -> Result<Vec<KnowledgeUnit>> {
+        // Use CozoDB native FTS index (`~notes:fts`) per NEXT.md Amendment 1.
+        // Falls back to in-memory scan only when FTS index is unavailable
+        // (e.g. freshly created store before any notes are indexed).
+        if !query.is_empty() {
+            let mut params = BTreeMap::new();
+            params.insert("query".to_string(), DataValue::from(query));
+            params.insert("k".to_string(), DataValue::from(50i64));
+
+            let script = r#"
+?[id, source, title, content, hash, embedding, observed_at, score] :=
+    ~notes:fts{ id, title, content | query: $query, k: $k, score_field: score },
+    *notes{ id, source, hash, embedding, observed_at }
+:order -score
+:limit $k
+"#;
+            if let Ok(result) = self
+                .cozo
+                .run_script(script, params, ScriptMutability::Immutable)
+            {
+                let mut out = Vec::new();
+                for row in result.rows {
+                    if let Some(unit) = self.row_to_knowledge_unit(&row) {
+                        out.push(unit);
+                    }
+                }
+                if !out.is_empty() {
+                    return Ok(out);
+                }
+            }
+        }
+
+        // Fallback: in-memory scan (empty-query case or FTS index not yet built)
         Ok(self
             .units
             .lock()
             .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
             .values()
             .filter(|unit| {
-                unit.content.contains(query)
+                query.is_empty()
+                    || unit.content.contains(query)
                     || unit
                         .title
                         .as_deref()
