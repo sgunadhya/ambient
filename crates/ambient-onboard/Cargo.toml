@@ -4,7 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-ambient-core = { path = "../ambient-core" }
+ambient-core  = { path = "../ambient-core" }
 ambient-store = { path = "../ambient-store" }
 ambient-query = { path = "../ambient-query" }
-chrono = "0.4"
+chrono        = "0.4"
+reqwest       = { version = "0.12", features = ["blocking", "json"] }

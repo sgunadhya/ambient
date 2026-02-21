@@ -155,6 +155,7 @@ dependencies = [
  "ambient-query",
  "ambient-store",
  "chrono",
+ "reqwest 0.12.28",
 ]
 
 [[package]]
