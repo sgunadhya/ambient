@@ -320,7 +320,7 @@ mod macos_runtime {
     fn create_url_handler_class() -> &'static objc2::runtime::AnyClass {
         static CLASS: std::sync::OnceLock<&'static objc2::runtime::AnyClass> =
             std::sync::OnceLock::new();
-        *CLASS.get_or_init(|| {
+        CLASS.get_or_init(|| {
             let mut builder =
                 objc2::runtime::ClassBuilder::new(c"AmbientUrlHandler", class!(NSObject)).unwrap();
 

@@ -118,14 +118,17 @@ impl AmbientQueryEngine {
 
 impl QueryEngine for AmbientQueryEngine {
     fn query(&self, req: QueryRequest) -> Result<Vec<QueryResult>> {
-        let units = if self.semantic_allowed() && self.reasoning.is_some() {
-            let reasoning = self.reasoning.as_ref().unwrap();
-            match reasoning.embed(&req.text) {
-                Ok(vec) => self
-                    .store
-                    .search_semantic(&vec, req.k)
-                    .or_else(|_| self.store.search_fulltext(&req.text)),
-                Err(_) => self.store.search_fulltext(&req.text),
+        let units = if self.semantic_allowed() {
+            if let Some(reasoning) = self.reasoning.as_ref() {
+                match reasoning.embed(&req.text) {
+                    Ok(vec) => self
+                        .store
+                        .search_semantic(&vec, req.k)
+                        .or_else(|_| self.store.search_fulltext(&req.text)),
+                    Err(_) => self.store.search_fulltext(&req.text),
+                }
+            } else {
+                self.store.search_fulltext(&req.text)
             }
         } else {
             self.store.search_fulltext(&req.text)

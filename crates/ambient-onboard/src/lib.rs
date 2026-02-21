@@ -199,14 +199,13 @@ impl SetupWizard {
 
     /// Run the setup wizard. Returns printable output lines.
     pub fn run(&self) -> Vec<String> {
-        let mut out = Vec::new();
+        let mut out = vec![
+            String::new(),
+            "🌱 Ambient — Personal Cognitive Intelligence".to_string(),
+            String::new(),
+            "Step 1/3: Knowledge Sources".to_string(),
+        ];
 
-        out.push(String::new());
-        out.push("🌱 Ambient — Personal Cognitive Intelligence".to_string());
-        out.push(String::new());
-
-        // Step 1 — Knowledge Sources
-        out.push("Step 1/3: Knowledge Sources".to_string());
         let vault = self.step_detect_vault(&mut out);
 
         // Step 2 — Semantic Search via ollama
