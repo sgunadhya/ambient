@@ -40,7 +40,7 @@ impl CozoStore {
             .map_err(|e| CoreError::Internal(format!("failed to initialize cozo: {e}")))?;
 
         let pulse_storage = tsink::StorageBuilder::new()
-            .with_data_path("~/.ambient/pulse")
+            .with_data_path(expand_home("~/.ambient/pulse").to_str().unwrap())
             .with_partition_duration(Duration::from_secs(3600))
             .with_retention(Duration::from_secs(90 * 24 * 3600))
             .with_wal_sync_mode(tsink::WalSyncMode::Periodic(Duration::from_secs(1)))
