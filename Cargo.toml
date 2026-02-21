@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/tsink",
+  "crates/ambient-core",
+  "crates/ambient-watcher",
+  "crates/ambient-normalizer",
+  "crates/ambient-store",
+  "crates/ambient-spotlight",
+  "crates/ambient-reasoning",
+  "crates/ambient-patterns",
+  "crates/ambient-triggers",
+  "crates/ambient-query",
+  "crates/ambient-menubar",
+  "crates/ambient-onboard",
+  "crates/ambient-cli",
+  "tests/integration",
+]

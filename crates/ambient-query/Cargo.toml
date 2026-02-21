@@ -1,0 +1,9 @@
+[package]
+name = "ambient-query"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ambient-core = { path = "../ambient-core" }
+ambient-store = { path = "../ambient-store" }
+ambient-reasoning = { path = "../ambient-reasoning" }

@@ -1,0 +1,11 @@
+[package]
+name = "ambient-patterns"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ambient-core = { path = "../ambient-core" }
+ambient-store = { path = "../ambient-store" }
+blake3 = "1"
+chrono = "0.4"
+uuid = "1"

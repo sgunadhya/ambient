@@ -1,0 +1,13 @@
+[package]
+name = "ambient-store"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ambient-core = { path = "../ambient-core" }
+chrono = "0.4"
+cozo = "0.7.6"
+rayon = "=1.5.3"
+serde_json = "1"
+tsink = { path = "../tsink" }
+uuid = "1"

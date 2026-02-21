@@ -1,0 +1,12 @@
+[package]
+name = "ambient-spotlight"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ambient-core = { path = "../ambient-core" }
+block2 = "0.6"
+chrono = "0.4"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+uuid = "1"

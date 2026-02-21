@@ -1,0 +1,16 @@
+[package]
+name = "ambient-triggers"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ambient-core = { path = "../ambient-core" }
+ambient-store = { path = "../ambient-store" }
+notify = "6"
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+chrono = "0.4"
+uuid = "1"

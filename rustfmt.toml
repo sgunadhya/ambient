@@ -1,0 +1,41 @@
+# rustfmt.toml — canonical formatting configuration for ambient
+
+edition = "2021"
+
+# ── Line width ────────────────────────────────────────────────────────────────
+max_width = 100
+comment_width = 100
+wrap_comments = true
+
+# ── Imports ───────────────────────────────────────────────────────────────────
+reorder_imports = true
+
+# ── Trailing commas & semicolons ──────────────────────────────────────────────
+trailing_comma = "Vertical"
+trailing_semicolon = true
+
+# ── Braces & control flow ─────────────────────────────────────────────────────
+brace_style = "SameLineWhere"
+control_brace_style = "AlwaysSameLine"
+
+# ── Functions ─────────────────────────────────────────────────────────────────
+fn_params_layout = "Tall"
+
+# ── Misc sugar ────────────────────────────────────────────────────────────────
+use_field_init_shorthand = true
+use_try_shorthand = true
+normalize_comments = true
+
+# ── Nightly-only options (requires `rustup override set nightly` or nightly CI) ─
+# Uncomment the block below and set unstable_features = true to enable them.
+#
+# unstable_features = true
+# imports_granularity = "Crate"          # merge/split use trees to crate level
+# group_imports = "StdExternalCrate"     # std | external | crate order
+# where_single_line = false              # always expand where clauses
+# blank_lines_upper_bound = 1            # collapse consecutive blanks
+# blank_lines_lower_bound = 0
+# struct_field_align_threshold = 0       # disable field alignment padding
+# enum_discrim_align_threshold = 0       # disable discriminant alignment padding
+# normalize_doc_attributes = true        # #[doc = "..."] → /// ...
+# hex_literal_case = "Upper"            # 0xDEADBEEF not 0xdeadbeef

@@ -1,0 +1,891 @@
+use std::collections::HashMap;
+use std::fs;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+use ambient_core::{
+    CapabilityGate, CapabilityStatus, FeedbackEvent, FeedbackSignal, GatedCapability, KnowledgeStore,
+    KnowledgeUnit, LoadAware, PulseEvent, PulseSampler, PulseSignal, QueryEngine, QueryRequest,
+    QueryResult, Result, SamplerHandle, SourceId,
+};
+use ambient_onboard::{HealthCheck, SetupWizard};
+use ambient_watcher::{
+    ActiveAppSampler, AudioInputSampler, ContextSwitchSampler, LoadBroadcaster, SystemLoadSampler,
+};
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+pub struct DaemonSamplers {
+    pub context_switch: Option<Arc<ContextSwitchSampler>>,
+    pub active_app: Option<Arc<ActiveAppSampler>>,
+    pub audio_input: Option<Arc<AudioInputSampler>>,
+}
+
+pub struct DaemonHandles {
+    pub context_switch: Option<SamplerHandle>,
+    pub active_app: Option<SamplerHandle>,
+    pub audio_input: Option<SamplerHandle>,
+    pub system_load: SamplerHandle,
+}
+
+#[derive(Debug, Clone)]
+pub struct AmbientConfig {
+    pub obsidian_vault: String,
+    pub spotlight: bool,
+    pub apple_notes: bool,
+    pub healthkit: bool,
+    pub calendar: bool,
+    pub self_reports: bool,
+    pub context_switches: bool,
+    pub active_app_titles: bool,
+    pub audio_input: bool,
+    pub window_title_allowlist: Vec<String>,
+    pub calendar_focus_block_patterns: Vec<String>,
+    pub checkin_reminder_time: String,
+    pub semantic_weight: f32,
+    pub feedback_weight: f32,
+    pub http_port: u16,
+    pub auth_token: Option<String>,
+}
+
+impl Default for AmbientConfig {
+    fn default() -> Self {
+        Self {
+            obsidian_vault: "~/Documents/Obsidian".to_string(),
+            spotlight: true,
+            apple_notes: false,
+            healthkit: false,
+            calendar: false,
+            self_reports: true,
+            context_switches: true,
+            active_app_titles: false,
+            audio_input: true,
+            window_title_allowlist: vec![
+                "com.apple.Xcode".to_string(),
+                "md.obsidian".to_string(),
+                "com.todesktop.230313mzl4w4u92".to_string(),
+            ],
+            calendar_focus_block_patterns: vec![
+                "Deep Work".to_string(),
+                "Focus".to_string(),
+                "No Meetings".to_string(),
+                "Blocked".to_string(),
+            ],
+            checkin_reminder_time: String::new(),
+            semantic_weight: 0.7,
+            feedback_weight: 0.3,
+            http_port: 7474,
+            auth_token: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct ConfigFile {
+    #[serde(default)]
+    sources: SourcesConfig,
+    #[serde(default)]
+    samplers: SamplersConfig,
+    #[serde(default)]
+    window_title_allowlist: WindowTitleAllowlist,
+    #[serde(default)]
+    calendar: CalendarConfig,
+    #[serde(default)]
+    checkin: CheckinConfig,
+    #[serde(default)]
+    query: QueryConfig,
+    #[serde(default)]
+    daemon: DaemonConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SourcesConfig {
+    obsidian_vault: String,
+    spotlight: bool,
+    apple_notes: bool,
+    healthkit: bool,
+    calendar: bool,
+    self_reports: bool,
+}
+
+impl Default for SourcesConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            obsidian_vault: d.obsidian_vault,
+            spotlight: d.spotlight,
+            apple_notes: d.apple_notes,
+            healthkit: d.healthkit,
+            calendar: d.calendar,
+            self_reports: d.self_reports,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct SamplersConfig {
+    context_switches: bool,
+    active_app_titles: bool,
+    audio_input: bool,
+}
+
+impl Default for SamplersConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            context_switches: d.context_switches,
+            active_app_titles: d.active_app_titles,
+            audio_input: d.audio_input,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct WindowTitleAllowlist {
+    apps: Vec<String>,
+}
+
+impl Default for WindowTitleAllowlist {
+    fn default() -> Self {
+        Self {
+            apps: AmbientConfig::default().window_title_allowlist,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct CalendarConfig {
+    focus_block_patterns: Vec<String>,
+}
+
+impl Default for CalendarConfig {
+    fn default() -> Self {
+        Self {
+            focus_block_patterns: AmbientConfig::default().calendar_focus_block_patterns,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+struct CheckinConfig {
+    reminder_time: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct QueryConfig {
+    semantic_weight: f32,
+    feedback_weight: f32,
+}
+
+impl Default for QueryConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            semantic_weight: d.semantic_weight,
+            feedback_weight: d.feedback_weight,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DaemonConfig {
+    http_port: u16,
+    auth_token: Option<String>,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            http_port: AmbientConfig::default().http_port,
+            auth_token: None,
+        }
+    }
+}
+
+impl AmbientConfig {
+    pub fn ensure_default(path: &PathBuf) -> Result<Self> {
+        if !path.exists() {
+            let parent = path.parent().ok_or_else(|| {
+                ambient_core::CoreError::InvalidInput("config path has no parent".to_string())
+            })?;
+            fs::create_dir_all(parent).map_err(|e| {
+                ambient_core::CoreError::Internal(format!("failed to create config dir: {e}"))
+            })?;
+            let body = default_config_toml();
+            fs::write(path, body).map_err(|e| {
+                ambient_core::CoreError::Internal(format!("failed to write config: {e}"))
+            })?;
+        }
+
+        Self::from_path(path)
+    }
+
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let raw = fs::read_to_string(path)
+            .map_err(|e| ambient_core::CoreError::Internal(format!("failed to read config: {e}")))?;
+        let parsed: ConfigFile = toml::from_str(&raw).map_err(|e| {
+            ambient_core::CoreError::InvalidInput(format!("invalid config TOML: {e}"))
+        })?;
+
+        Ok(Self {
+            obsidian_vault: parsed.sources.obsidian_vault,
+            spotlight: parsed.sources.spotlight,
+            apple_notes: parsed.sources.apple_notes,
+            healthkit: parsed.sources.healthkit,
+            calendar: parsed.sources.calendar,
+            self_reports: parsed.sources.self_reports,
+            context_switches: parsed.samplers.context_switches,
+            active_app_titles: parsed.samplers.active_app_titles,
+            audio_input: parsed.samplers.audio_input,
+            window_title_allowlist: parsed.window_title_allowlist.apps,
+            calendar_focus_block_patterns: parsed.calendar.focus_block_patterns,
+            checkin_reminder_time: parsed.checkin.reminder_time,
+            semantic_weight: parsed.query.semantic_weight,
+            feedback_weight: parsed.query.feedback_weight,
+            http_port: parsed.daemon.http_port,
+            auth_token: parsed
+                .daemon
+                .auth_token
+                .and_then(|token| if token.trim().is_empty() { None } else { Some(token) }),
+        })
+    }
+}
+
+pub fn start_pulse_pipeline(
+    store: Arc<dyn KnowledgeStore>,
+    samplers: DaemonSamplers,
+    system_load_sampler: Arc<SystemLoadSampler>,
+    broadcaster: Arc<LoadBroadcaster>,
+) -> Result<DaemonHandles> {
+    let mut components: Vec<Arc<dyn LoadAware>> = Vec::new();
+    if let Some(context) = &samplers.context_switch {
+        components.push(context.clone() as Arc<dyn LoadAware>);
+    }
+    if let Some(active) = &samplers.active_app {
+        components.push(active.clone() as Arc<dyn LoadAware>);
+    }
+    if let Some(audio) = &samplers.audio_input {
+        components.push(audio.clone() as Arc<dyn LoadAware>);
+    }
+    register_load_aware_components(&broadcaster, components);
+
+    let (pulse_tx, pulse_rx) = std::sync::mpsc::channel();
+    let context_switch = match samplers.context_switch {
+        Some(s) => Some(s.start(pulse_tx.clone())?),
+        None => None,
+    };
+    let active_app = match samplers.active_app {
+        Some(s) => Some(s.start(pulse_tx.clone())?),
+        None => None,
+    };
+    let audio_input = match samplers.audio_input {
+        Some(s) => Some(s.start(pulse_tx)?),
+        None => None,
+    };
+    let system_load = system_load_sampler.start()?;
+
+    std::thread::spawn(move || {
+        for event in pulse_rx {
+            let _ = store.record_pulse(event);
+        }
+    });
+
+    Ok(DaemonHandles {
+        context_switch,
+        active_app,
+        audio_input,
+        system_load,
+    })
+}
+
+pub fn run_query(engine: &dyn QueryEngine, text: &str, with_pulse: bool) -> Result<Vec<QueryResult>> {
+    engine.query(QueryRequest {
+        text: text.to_string(),
+        k: 10,
+        include_pulse_context: with_pulse,
+        context_window_secs: Some(120),
+    })
+}
+
+pub fn run_setup(gate: Arc<dyn CapabilityGate>) -> Vec<String> {
+    let wizard = SetupWizard::new(gate);
+    wizard.run()
+}
+
+pub fn run_doctor(gate: Arc<dyn CapabilityGate>) -> Vec<String> {
+    let check = HealthCheck::new(gate);
+    check.status_lines()
+}
+
+pub fn capability_statuses(gate: &dyn CapabilityGate) -> HashMap<GatedCapability, CapabilityStatus> {
+    let capabilities = [
+        GatedCapability::SemanticSearch,
+        GatedCapability::CognitiveBadges,
+        GatedCapability::PatternReports,
+        GatedCapability::HealthCorrelations,
+        GatedCapability::CalendarContext,
+        GatedCapability::MenuBarOverlay,
+    ];
+
+    capabilities
+        .iter()
+        .map(|c| (*c, gate.status(*c)))
+        .collect::<HashMap<_, _>>()
+}
+
+pub fn submit_checkin(
+    store: &dyn KnowledgeStore,
+    energy: u8,
+    mood: u8,
+    note: Option<String>,
+) -> Result<KnowledgeUnit> {
+    if !(1..=5).contains(&energy) {
+        return Err(ambient_core::CoreError::InvalidInput(
+            "energy must be in range 1..=5".to_string(),
+        ));
+    }
+    if !(1..=5).contains(&mood) {
+        return Err(ambient_core::CoreError::InvalidInput(
+            "mood must be in range 1..=5".to_string(),
+        ));
+    }
+
+    let observed_at = Utc::now();
+    let content = if let Some(n) = &note {
+        format!("Energy: {energy}/5, Mood: {mood}/5. {n}")
+    } else {
+        format!("Energy: {energy}/5, Mood: {mood}/5")
+    };
+
+    let mut metadata = HashMap::new();
+    metadata.insert("energy".to_string(), serde_json::Value::from(energy));
+    metadata.insert("mood".to_string(), serde_json::Value::from(mood));
+
+    let hash = blake3::hash(content.as_bytes());
+    let mut content_hash = [0u8; 32];
+    content_hash.copy_from_slice(hash.as_bytes());
+
+    let unit = KnowledgeUnit {
+        id: Uuid::new_v4(),
+        source: SourceId::new("self_report"),
+        content,
+        title: Some(format!("Check-in — {}", observed_at.format("%Y-%m-%d"))),
+        metadata,
+        embedding: None,
+        observed_at,
+        content_hash,
+    };
+
+    store.upsert(unit.clone())?;
+    store.record_pulse(PulseEvent {
+        timestamp: observed_at,
+        signal: PulseSignal::EnergyLevel { score: energy },
+    })?;
+    store.record_pulse(PulseEvent {
+        timestamp: observed_at,
+        signal: PulseSignal::MoodLevel { score: mood },
+    })?;
+
+    Ok(unit)
+}
+
+pub fn record_query_feedback(
+    store: &dyn KnowledgeStore,
+    query_text: &str,
+    unit_id: Uuid,
+    useful: bool,
+    ms_to_action: Option<u32>,
+) -> Result<FeedbackEvent> {
+    let signal = if useful {
+        FeedbackSignal::QueryResultActedOn {
+            query_text: query_text.to_string(),
+            unit_id,
+            action: ambient_core::ResultAction::OpenedSource,
+            ms_to_action: ms_to_action.unwrap_or(0),
+        }
+    } else {
+        FeedbackSignal::QueryResultDismissed {
+            query_text: query_text.to_string(),
+            unit_id,
+        }
+    };
+
+    let event = FeedbackEvent {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        signal,
+    };
+
+    store.record_feedback(event.clone())?;
+    Ok(event)
+}
+
+fn register_load_aware_components(broadcaster: &LoadBroadcaster, components: Vec<Arc<dyn LoadAware>>) {
+    for component in components {
+        broadcaster.register(component);
+    }
+}
+
+fn default_config_toml() -> &'static str {
+    r#"[sources]
+obsidian_vault = "~/Documents/Obsidian"
+spotlight = true
+apple_notes = false
+healthkit = false
+calendar = false
+self_reports = true
+
+[samplers]
+context_switches = true
+active_app_titles = false
+audio_input = true
+
+[window_title_allowlist]
+apps = ["com.apple.Xcode", "md.obsidian", "com.todesktop.230313mzl4w4u92"]
+
+[calendar]
+focus_block_patterns = ["Deep Work", "Focus", "No Meetings", "Blocked"]
+
+[checkin]
+reminder_time = ""
+
+[query]
+semantic_weight = 0.7
+feedback_weight = 0.3
+
+[reasoning]
+backend = "local"
+ollama_url = "http://localhost:11434"
+
+[daemon]
+http_port = 7474
+auth_token = ""
+"#
+}
+
+#[derive(Clone)]
+pub struct HttpAppState {
+    pub engine: Arc<dyn QueryEngine>,
+    pub store: Arc<dyn KnowledgeStore>,
+    pub auth_token: Option<String>,
+    pub status_probe: Option<Arc<dyn DaemonStatusProbe>>,
+    pub deep_link_focus: Arc<Mutex<Option<Uuid>>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct QueryHttpRequest {
+    pub text: String,
+    pub k: usize,
+    pub include_pulse_context: bool,
+    pub context_window_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CheckinRequest {
+    pub energy: u8,
+    pub mood: u8,
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct FeedbackRequest {
+    pub query_text: String,
+    pub unit_id: Uuid,
+    pub useful: bool,
+    pub ms_to_action: Option<u32>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub units: usize,
+    pub sources: Vec<String>,
+    pub embedding_available: bool,
+    pub load: String,
+    pub queue_depth: usize,
+    pub upserted_units: u64,
+    pub active_sources: Vec<String>,
+    pub active_samplers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RelatedParams {
+    pub depth: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UnitParams {
+    pub context_window_secs: Option<u64>,
+}
+
+pub trait DaemonStatusProbe: Send + Sync {
+    fn embedding_available(&self) -> bool;
+    fn load(&self) -> String;
+    fn queue_depth(&self) -> usize;
+    fn upserted_units(&self) -> u64;
+    fn active_sources(&self) -> Vec<String>;
+    fn active_samplers(&self) -> Vec<String>;
+}
+
+pub fn build_router(state: HttpAppState) -> Router {
+    Router::new()
+        .route("/query", post(http_query))
+        .route("/unit/:id", get(http_unit))
+        .route("/related/:id", get(http_related))
+        .route("/health", get(http_health))
+        .route("/checkin", post(http_checkin))
+        .route("/feedback", post(http_feedback))
+        .route("/open/unit/:id", post(http_open_unit))
+        .route("/open/focus", get(http_get_focus))
+        .with_state(state)
+}
+
+pub async fn run_http_server(addr: SocketAddr, state: HttpAppState) -> Result<()> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| ambient_core::CoreError::Internal(format!("failed to bind server: {e}")))?;
+
+    axum::serve(listener, build_router(state))
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await
+        .map_err(|e| ambient_core::CoreError::Internal(format!("http server error: {e}")))?;
+    Ok(())
+}
+
+async fn http_query(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<QueryHttpRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+
+    let result = state.engine.query(QueryRequest {
+        text: req.text,
+        k: req.k,
+        include_pulse_context: req.include_pulse_context,
+        context_window_secs: req.context_window_secs,
+    });
+    map_result(result)
+}
+
+async fn http_unit(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(params): Query<UnitParams>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+
+    let context_window_secs = params.context_window_secs.unwrap_or(3600);
+    let result = state
+        .store
+        .unit_with_context(id, context_window_secs)
+        .and_then(|opt| match opt {
+            Some((unit, pulse, cognitive_state)) => {
+                let feedback = state.store.feedback_score(unit.id).unwrap_or(0.5);
+                Ok(QueryResult {
+                    unit,
+                    score: 1.0,
+                    pulse_context: Some(pulse),
+                    cognitive_state: Some(cognitive_state),
+                    historical_feedback_score: feedback,
+                    capability_status: None,
+                })
+            }
+            None => Err(ambient_core::CoreError::NotFound(format!("unit {id} not found"))),
+        });
+
+    map_result(result)
+}
+
+async fn http_related(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+    Query(params): Query<RelatedParams>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    let depth = params.depth.unwrap_or(2);
+    map_result(state.store.related(id, depth))
+}
+
+async fn http_health(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+
+    let units = match state.store.search_fulltext("") {
+        Ok(found) => found.len(),
+        Err(_) => 0,
+    };
+    let mut sources = state
+        .store
+        .search_fulltext("")
+        .unwrap_or_default()
+        .into_iter()
+        .map(|u| u.source.0)
+        .collect::<Vec<_>>();
+    sources.sort();
+    sources.dedup();
+
+    let (embedding_available, load, queue_depth, upserted_units, active_sources, active_samplers) =
+        match &state.status_probe {
+            Some(probe) => (
+                probe.embedding_available(),
+                probe.load(),
+                probe.queue_depth(),
+                probe.upserted_units(),
+                probe.active_sources(),
+                probe.active_samplers(),
+            ),
+            None => (true, "unconstrained".to_string(), 0, 0, Vec::new(), Vec::new()),
+    };
+
+    let payload = HealthResponse {
+        status: "ok".to_string(),
+        units,
+        sources,
+        embedding_available,
+        load,
+        queue_depth,
+        upserted_units,
+        active_sources,
+        active_samplers,
+    };
+    (StatusCode::OK, Json(payload)).into_response()
+}
+
+async fn http_checkin(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<CheckinRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    map_result(submit_checkin(state.store.as_ref(), req.energy, req.mood, req.note))
+}
+
+async fn http_feedback(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<FeedbackRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    map_result(record_query_feedback(
+        state.store.as_ref(),
+        &req.query_text,
+        req.unit_id,
+        req.useful,
+        req.ms_to_action,
+    ))
+}
+
+async fn http_open_unit(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<Uuid>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    if let Ok(mut guard) = state.deep_link_focus.lock() {
+        *guard = Some(id);
+    }
+    (StatusCode::OK, Json(serde_json::json!({ "focused_unit": id }))).into_response()
+}
+
+async fn http_get_focus(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    let focused = state.deep_link_focus.lock().ok().and_then(|g| *g);
+    (StatusCode::OK, Json(serde_json::json!({ "focused_unit": focused }))).into_response()
+}
+
+fn authorize(token: &Option<String>, headers: &HeaderMap) -> std::result::Result<(), Response> {
+    match token {
+        Some(expected) => {
+            let actual = headers
+                .get("X-Ambient-Token")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or_default();
+            if actual == expected {
+                Ok(())
+            } else {
+                Err((StatusCode::UNAUTHORIZED, "missing or invalid X-Ambient-Token").into_response())
+            }
+        }
+        None => Ok(()),
+    }
+}
+
+fn map_result<T: Serialize>(result: Result<T>) -> Response {
+    match result {
+        Ok(value) => (StatusCode::OK, Json(value)).into_response(),
+        Err(err) => {
+            let code = match err {
+                ambient_core::CoreError::NotFound(_) => StatusCode::NOT_FOUND,
+                ambient_core::CoreError::InvalidInput(_) => StatusCode::BAD_REQUEST,
+                ambient_core::CoreError::Unsupported(_) => StatusCode::NOT_IMPLEMENTED,
+                ambient_core::CoreError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (code, Json(serde_json::json!({ "error": err.to_string() }))).into_response()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+
+    use ambient_core::mocks::{MockKnowledgeStore, MockQueryEngine};
+    use ambient_core::{KnowledgeStore, KnowledgeUnit, QueryResult, SourceId};
+    use ambient_onboard::InMemoryCapabilityGate;
+    use axum::body::{to_bytes, Body};
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use uuid::Uuid;
+
+    use crate::{
+        build_router, capability_statuses, record_query_feedback, run_doctor, run_setup,
+        submit_checkin, HttpAppState,
+    };
+
+    #[test]
+    fn checkin_writes_unit_and_pulse() {
+        let store = MockKnowledgeStore::default();
+
+        let unit = submit_checkin(&store, 4, 3, Some("deep work".to_string())).expect("checkin works");
+
+        assert_eq!(unit.source.0, "self_report");
+        assert!(unit.content.contains("Energy: 4/5"));
+    }
+
+    #[test]
+    fn setup_and_doctor_are_wired() {
+        let gate = Arc::new(InMemoryCapabilityGate::default());
+        gate.seed_defaults();
+
+        let setup_steps = run_setup(gate.clone());
+        assert!(!setup_steps.is_empty());
+
+        let status = run_doctor(gate.clone());
+        assert!(!status.is_empty());
+
+        let map = capability_statuses(gate.as_ref());
+        assert!(map.contains_key(&ambient_core::GatedCapability::SemanticSearch));
+    }
+
+    #[test]
+    fn feedback_event_records() {
+        let store = MockKnowledgeStore::default();
+        let id = uuid::Uuid::new_v4();
+
+        let event = record_query_feedback(&store, "query", id, true, Some(1500)).expect("feedback");
+        assert_eq!(event.id.get_version_num(), 4);
+    }
+
+    #[tokio::test]
+    async fn http_query_route_returns_results() {
+        let store = Arc::new(MockKnowledgeStore::default());
+        let engine = Arc::new(MockQueryEngine::default());
+        let unit = KnowledgeUnit {
+            id: Uuid::new_v4(),
+            source: SourceId::new("obsidian"),
+            content: "hello".to_string(),
+            title: Some("hello".to_string()),
+            metadata: HashMap::new(),
+            embedding: None,
+            observed_at: chrono::Utc::now(),
+            content_hash: [1; 32],
+        };
+        store.upsert(unit.clone()).expect("upsert");
+        engine
+            .results
+            .lock()
+            .expect("results lock")
+            .push(QueryResult {
+                unit,
+                score: 1.0,
+                pulse_context: None,
+                cognitive_state: None,
+                historical_feedback_score: 0.5,
+                capability_status: None,
+            });
+
+        let app = build_router(HttpAppState {
+            engine,
+            store,
+            auth_token: None,
+            status_probe: None,
+            deep_link_focus: Arc::new(Mutex::new(None)),
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"text":"hello","k":10,"include_pulse_context":false,"context_window_secs":120}"#,
+            ))
+            .expect("request");
+
+        let response = app.oneshot(req).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("bytes");
+        let parsed: Vec<QueryResult> = serde_json::from_slice(&body).expect("json");
+        assert_eq!(parsed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn http_auth_token_is_enforced() {
+        let store = Arc::new(MockKnowledgeStore::default());
+        let engine = Arc::new(MockQueryEngine::default());
+        let app = build_router(HttpAppState {
+            engine,
+            store,
+            auth_token: Some("secret".to_string()),
+            status_probe: None,
+            deep_link_focus: Arc::new(Mutex::new(None)),
+        });
+
+        let unauthorized = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .expect("request");
+        let unauthorized_resp = app.clone().oneshot(unauthorized).await.expect("response");
+        assert_eq!(unauthorized_resp.status(), StatusCode::UNAUTHORIZED);
+
+        let authorized = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .header("X-Ambient-Token", "secret")
+            .body(Body::empty())
+            .expect("request");
+        let authorized_resp = app.oneshot(authorized).await.expect("response");
+        assert_eq!(authorized_resp.status(), StatusCode::OK);
+    }
+}

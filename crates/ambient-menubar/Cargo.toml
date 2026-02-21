@@ -1,0 +1,12 @@
+[package]
+name = "ambient-menubar"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ambient-core = { path = "../ambient-core" }
+ambient-query = { path = "../ambient-query" }
+uuid = "1"
+
+[dev-dependencies]
+chrono = "0.4"

@@ -1,0 +1,8 @@
+# Rust
+/target/
+
+# macOS
+.DS_Store
+
+# Markdown (requested)
+README.md
