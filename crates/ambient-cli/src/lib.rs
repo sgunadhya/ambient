@@ -7,9 +7,15 @@ use std::sync::{Arc, Mutex};
 use ambient_core::{
     CapabilityGate, CapabilityStatus, FeedbackEvent, FeedbackSignal, GatedCapability, KnowledgeStore,
     KnowledgeUnit, LoadAware, PulseEvent, PulseSampler, PulseSignal, QueryEngine, QueryRequest,
-    QueryResult, Result, SamplerHandle, SourceId,
+    QueryResult, Result, SamplerHandle, SourceId, StreamProvider, StreamTransport, TransportStatus,
+    ConsumerId, Offset, EventLogEntry,
 };
 use ambient_onboard::{HealthCheck, SetupWizard};
+use ambient_stream::SqliteStreamProvider;
+use ambient_transport_bonjour::BonjourTransport;
+use ambient_transport_cloudkit::{CloudKitTransport, JsonPayloadFetcher};
+use ambient_transport_google_health::GoogleHealthTransport;
+use ambient_transport_local::LocalTransport;
 use ambient_watcher::{
     ActiveAppSampler, AudioInputSampler, ContextSwitchSampler, LoadBroadcaster, SystemLoadSampler,
 };
@@ -18,6 +24,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum::body::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -28,11 +35,187 @@ pub struct DaemonSamplers {
     pub audio_input: Option<Arc<AudioInputSampler>>,
 }
 
+pub struct TransportRegistry {
+    transports: Vec<Arc<dyn StreamTransport>>,
+    handles: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+}
+
+impl Default for TransportRegistry {
+    fn default() -> Self {
+        Self {
+            transports: Vec::new(),
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl TransportRegistry {
+    pub fn from_config(config: &AmbientConfig) -> Self {
+        let mut transports: Vec<Arc<dyn StreamTransport>> = vec![Arc::new(LocalTransport::new(
+            config.obsidian_vault.clone(),
+            config.spotlight,
+            config.context_switches,
+            config.active_app_titles,
+            config.audio_input,
+        ))];
+        if config.bonjour {
+            transports.push(Arc::new(BonjourTransport::default()));
+        }
+        if config.cloudkit {
+            transports.push(Arc::new(CloudKitTransport::with_config(
+                config.cloudkit_container.clone(),
+                config.cloudkit_zone_name.clone(),
+                Arc::new(JsonPayloadFetcher),
+            )));
+        }
+        if config.google_health {
+            transports.push(Arc::new(GoogleHealthTransport::default()));
+        }
+        Self {
+            transports,
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    #[cfg(test)]
+    fn from_transports(transports: Vec<Arc<dyn StreamTransport>>) -> Self {
+        Self {
+            transports,
+            handles: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn start_all(&self, provider: Arc<dyn StreamProvider>) -> Result<()> {
+        let mut handles = self
+            .handles
+            .lock()
+            .map_err(|_| ambient_core::CoreError::Internal("transport handles lock poisoned".to_string()))?;
+        handles.clear();
+        for transport in &self.transports {
+            let path = transport_state_path(&transport.transport_id())?;
+            if path.exists() {
+                if let Ok(bytes) = fs::read(&path) {
+                    let _ = transport.load_state(&bytes);
+                }
+            }
+            handles.push(transport.start(provider.clone())?);
+        }
+        Ok(())
+    }
+
+    pub fn stop_all(&self) -> Result<()> {
+        for transport in &self.transports {
+            if let Some(bytes) = transport.save_state()? {
+                let path = transport_state_path(&transport.transport_id())?;
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|e| {
+                        ambient_core::CoreError::Internal(format!(
+                            "failed creating transport state dir: {e}"
+                        ))
+                    })?;
+                }
+                fs::write(&path, bytes).map_err(|e| {
+                    ambient_core::CoreError::Internal(format!(
+                        "failed writing transport state {}: {e}",
+                        path.display()
+                    ))
+                })?;
+            }
+            transport.stop()?;
+        }
+        let mut handles = self
+            .handles
+            .lock()
+            .map_err(|_| ambient_core::CoreError::Internal("transport handles lock poisoned".to_string()))?;
+        for handle in handles.drain(..) {
+            handle.abort();
+        }
+        Ok(())
+    }
+
+    pub fn status_all(&self) -> Vec<TransportStatus> {
+        self.transports.iter().map(|t| t.status()).collect()
+    }
+
+    pub fn on_push_notification(&self, id: &str, payload: Vec<u8>) -> Result<bool> {
+        if let Some(transport) = self
+            .transports
+            .iter()
+            .find(|t| t.transport_id().as_str() == id)
+        {
+            transport.on_push_notification(payload)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+pub fn open_default_stream_provider() -> Result<Arc<dyn StreamProvider>> {
+    let home = std::env::var("HOME")
+        .map_err(|e| ambient_core::CoreError::Internal(format!("failed to read HOME: {e}")))?;
+    let path = PathBuf::from(home).join(".ambient").join("stream.db");
+    let provider = SqliteStreamProvider::open(&path)?;
+    Ok(Arc::new(provider))
+}
+
+fn transport_state_path(transport_id: &str) -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .map_err(|e| ambient_core::CoreError::Internal(format!("failed to read HOME: {e}")))?;
+    Ok(PathBuf::from(home)
+        .join(".ambient")
+        .join("transport_state")
+        .join(transport_id))
+}
+
 pub struct DaemonHandles {
     pub context_switch: Option<SamplerHandle>,
     pub active_app: Option<SamplerHandle>,
     pub audio_input: Option<SamplerHandle>,
     pub system_load: SamplerHandle,
+}
+
+pub struct PulseConsumer {
+    provider: Arc<dyn StreamProvider>,
+    store: Arc<dyn KnowledgeStore>,
+    consumer_id: ConsumerId,
+    offset: Mutex<Offset>,
+}
+
+impl PulseConsumer {
+    pub fn new(
+        provider: Arc<dyn StreamProvider>,
+        store: Arc<dyn KnowledgeStore>,
+        consumer_id: ConsumerId,
+    ) -> Result<Self> {
+        let offset = provider.last_committed(&consumer_id)?.unwrap_or(0);
+        Ok(Self {
+            provider,
+            store,
+            consumer_id,
+            offset: Mutex::new(offset),
+        })
+    }
+
+    pub fn poll_once(&self, limit: usize) -> Result<usize> {
+        let mut offset = self
+            .offset
+            .lock()
+            .map_err(|_| ambient_core::CoreError::Internal("pulse consumer offset lock poisoned".to_string()))?;
+        let batch = self.provider.read(&self.consumer_id, *offset, limit)?;
+        let mut written = 0usize;
+
+        for (next_offset, entry) in batch {
+            if let EventLogEntry::Pulse(event) = entry {
+                if self.store.record_pulse(event).is_ok() {
+                    written += 1;
+                }
+            }
+            self.provider.commit(&self.consumer_id, next_offset)?;
+            *offset = next_offset;
+        }
+
+        Ok(written)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +226,9 @@ pub struct AmbientConfig {
     pub healthkit: bool,
     pub calendar: bool,
     pub self_reports: bool,
+    pub bonjour: bool,
+    pub cloudkit: bool,
+    pub google_health: bool,
     pub context_switches: bool,
     pub active_app_titles: bool,
     pub audio_input: bool,
@@ -51,6 +237,8 @@ pub struct AmbientConfig {
     pub checkin_reminder_time: String,
     pub semantic_weight: f32,
     pub feedback_weight: f32,
+    pub cloudkit_container: String,
+    pub cloudkit_zone_name: String,
     pub http_port: u16,
     pub auth_token: Option<String>,
 }
@@ -64,6 +252,9 @@ impl Default for AmbientConfig {
             healthkit: false,
             calendar: false,
             self_reports: true,
+            bonjour: true,
+            cloudkit: false,
+            google_health: false,
             context_switches: true,
             active_app_titles: false,
             audio_input: true,
@@ -81,6 +272,8 @@ impl Default for AmbientConfig {
             checkin_reminder_time: String::new(),
             semantic_weight: 0.7,
             feedback_weight: 0.3,
+            cloudkit_container: "iCloud.dev.ambient.private".to_string(),
+            cloudkit_zone_name: "AmbientZone".to_string(),
             http_port: 7474,
             auth_token: None,
         }
@@ -92,6 +285,8 @@ struct ConfigFile {
     #[serde(default)]
     sources: SourcesConfig,
     #[serde(default)]
+    transports: TransportsConfig,
+    #[serde(default)]
     samplers: SamplersConfig,
     #[serde(default)]
     window_title_allowlist: WindowTitleAllowlist,
@@ -101,6 +296,8 @@ struct ConfigFile {
     checkin: CheckinConfig,
     #[serde(default)]
     query: QueryConfig,
+    #[serde(default)]
+    cloudkit: CloudKitConfig,
     #[serde(default)]
     daemon: DaemonConfig,
 }
@@ -143,6 +340,24 @@ impl Default for SamplersConfig {
             context_switches: d.context_switches,
             active_app_titles: d.active_app_titles,
             audio_input: d.audio_input,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct TransportsConfig {
+    bonjour: bool,
+    cloudkit: bool,
+    google_health: bool,
+}
+
+impl Default for TransportsConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            bonjour: d.bonjour,
+            cloudkit: d.cloudkit,
+            google_health: d.google_health,
         }
     }
 }
@@ -195,6 +410,22 @@ impl Default for QueryConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct CloudKitConfig {
+    container: String,
+    zone_name: String,
+}
+
+impl Default for CloudKitConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            container: d.cloudkit_container,
+            zone_name: d.cloudkit_zone_name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct DaemonConfig {
     http_port: u16,
     auth_token: Option<String>,
@@ -241,6 +472,9 @@ impl AmbientConfig {
             healthkit: parsed.sources.healthkit,
             calendar: parsed.sources.calendar,
             self_reports: parsed.sources.self_reports,
+            bonjour: parsed.transports.bonjour,
+            cloudkit: parsed.transports.cloudkit,
+            google_health: parsed.transports.google_health,
             context_switches: parsed.samplers.context_switches,
             active_app_titles: parsed.samplers.active_app_titles,
             audio_input: parsed.samplers.audio_input,
@@ -249,6 +483,8 @@ impl AmbientConfig {
             checkin_reminder_time: parsed.checkin.reminder_time,
             semantic_weight: parsed.query.semantic_weight,
             feedback_weight: parsed.query.feedback_weight,
+            cloudkit_container: parsed.cloudkit.container,
+            cloudkit_zone_name: parsed.cloudkit.zone_name,
             http_port: parsed.daemon.http_port,
             auth_token: parsed
                 .daemon
@@ -259,7 +495,7 @@ impl AmbientConfig {
 }
 
 pub fn start_pulse_pipeline(
-    store: Arc<dyn KnowledgeStore>,
+    provider: Arc<dyn StreamProvider>,
     samplers: DaemonSamplers,
     system_load_sampler: Arc<SystemLoadSampler>,
     broadcaster: Arc<LoadBroadcaster>,
@@ -293,7 +529,7 @@ pub fn start_pulse_pipeline(
 
     std::thread::spawn(move || {
         for event in pulse_rx {
-            let _ = store.record_pulse(event);
+            let _ = provider.append_pulse(event);
         }
     });
 
@@ -442,6 +678,11 @@ healthkit = false
 calendar = false
 self_reports = true
 
+[transports]
+bonjour = true
+cloudkit = false
+google_health = false
+
 [samplers]
 context_switches = true
 active_app_titles = false
@@ -460,6 +701,10 @@ reminder_time = ""
 semantic_weight = 0.7
 feedback_weight = 0.3
 
+[cloudkit]
+container = "iCloud.dev.ambient.private"
+zone_name = "AmbientZone"
+
 [reasoning]
 backend = "local"
 ollama_url = "http://localhost:11434"
@@ -477,6 +722,7 @@ pub struct HttpAppState {
     pub auth_token: Option<String>,
     pub status_probe: Option<Arc<dyn DaemonStatusProbe>>,
     pub deep_link_focus: Arc<Mutex<Option<Uuid>>>,
+    pub transport_registry: Option<Arc<TransportRegistry>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -513,6 +759,7 @@ pub struct HealthResponse {
     pub upserted_units: u64,
     pub active_sources: Vec<String>,
     pub active_samplers: Vec<String>,
+    pub transport_statuses: Vec<TransportStatus>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -532,6 +779,9 @@ pub trait DaemonStatusProbe: Send + Sync {
     fn upserted_units(&self) -> u64;
     fn active_sources(&self) -> Vec<String>;
     fn active_samplers(&self) -> Vec<String>;
+    fn transport_statuses(&self) -> Vec<TransportStatus> {
+        Vec::new()
+    }
 }
 
 pub fn build_router(state: HttpAppState) -> Router {
@@ -542,6 +792,7 @@ pub fn build_router(state: HttpAppState) -> Router {
         .route("/health", get(http_health))
         .route("/checkin", post(http_checkin))
         .route("/feedback", post(http_feedback))
+        .route("/transport/:id/push", post(http_transport_push))
         .route("/open/unit/:id", post(http_open_unit))
         .route("/open/focus", get(http_get_focus))
         .with_state(state)
@@ -592,7 +843,7 @@ async fn http_unit(
     let context_window_secs = params.context_window_secs.unwrap_or(3600);
     let result = state
         .store
-        .unit_with_context(id, context_window_secs)
+        .unit_with_context_live(id, context_window_secs)
         .and_then(|opt| match opt {
             Some((unit, pulse, cognitive_state)) => {
                 let feedback = state.store.feedback_score(unit.id).unwrap_or(0.5);
@@ -643,7 +894,15 @@ async fn http_health(State(state): State<HttpAppState>, headers: HeaderMap) -> R
     sources.sort();
     sources.dedup();
 
-    let (embedding_available, load, queue_depth, upserted_units, active_sources, active_samplers) =
+    let (
+        embedding_available,
+        load,
+        queue_depth,
+        upserted_units,
+        active_sources,
+        active_samplers,
+        transport_statuses,
+    ) =
         match &state.status_probe {
             Some(probe) => (
                 probe.embedding_available(),
@@ -652,8 +911,17 @@ async fn http_health(State(state): State<HttpAppState>, headers: HeaderMap) -> R
                 probe.upserted_units(),
                 probe.active_sources(),
                 probe.active_samplers(),
+                probe.transport_statuses(),
             ),
-            None => (true, "unconstrained".to_string(), 0, 0, Vec::new(), Vec::new()),
+            None => (
+                true,
+                "unconstrained".to_string(),
+                0,
+                0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
     };
 
     let payload = HealthResponse {
@@ -666,6 +934,7 @@ async fn http_health(State(state): State<HttpAppState>, headers: HeaderMap) -> R
         upserted_units,
         active_sources,
         active_samplers,
+        transport_statuses,
     };
     (StatusCode::OK, Json(payload)).into_response()
 }
@@ -720,6 +989,41 @@ async fn http_get_focus(State(state): State<HttpAppState>, headers: HeaderMap) -
     (StatusCode::OK, Json(serde_json::json!({ "focused_unit": focused }))).into_response()
 }
 
+async fn http_transport_push(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    AxumPath(id): AxumPath<String>,
+    body: Bytes,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    let Some(registry) = &state.transport_registry else {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(serde_json::json!({"error":"transport registry unavailable"})),
+        )
+            .into_response();
+    };
+    match registry.on_push_notification(&id, body.to_vec()) {
+        Ok(true) => (
+            StatusCode::ACCEPTED,
+            Json(serde_json::json!({"accepted": true, "transport_id": id})),
+        )
+            .into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error":"transport not found", "transport_id": id})),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": err.to_string(), "transport_id": id})),
+        )
+            .into_response(),
+    }
+}
+
 fn authorize(token: &Option<String>, headers: &HeaderMap) -> std::result::Result<(), Response> {
     match token {
         Some(expected) => {
@@ -755,10 +1059,14 @@ fn map_result<T: Serialize>(result: Result<T>) -> Response {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use ambient_core::mocks::{MockKnowledgeStore, MockQueryEngine};
-    use ambient_core::{KnowledgeStore, KnowledgeUnit, QueryResult, SourceId};
+    use ambient_core::{
+        KnowledgeStore, KnowledgeUnit, QueryResult, SourceId, StreamProvider, StreamTransport,
+        TransportId, TransportState, TransportStatus,
+    };
     use ambient_onboard::InMemoryCapabilityGate;
     use axum::body::{to_bytes, Body};
     use axum::http::{Request, StatusCode};
@@ -838,6 +1146,7 @@ mod tests {
             auth_token: None,
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
+            transport_registry: None,
         });
 
         let req = Request::builder()
@@ -869,6 +1178,7 @@ mod tests {
             auth_token: Some("secret".to_string()),
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
+            transport_registry: None,
         });
 
         let unauthorized = Request::builder()
@@ -887,5 +1197,187 @@ mod tests {
             .expect("request");
         let authorized_resp = app.oneshot(authorized).await.expect("response");
         assert_eq!(authorized_resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn http_transport_push_route_accepts_payload() {
+        let store = Arc::new(MockKnowledgeStore::default());
+        let engine = Arc::new(MockQueryEngine::default());
+        let app = build_router(HttpAppState {
+            engine,
+            store,
+            auth_token: None,
+            status_probe: None,
+            deep_link_focus: Arc::new(Mutex::new(None)),
+            transport_registry: Some(Arc::new(crate::TransportRegistry::default())),
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/transport/cloudkit/push")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"records":[]}"#))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_transport_push_route_dispatches_to_target_transport() {
+        struct FakeTransport {
+            id: String,
+            pushes: Arc<AtomicUsize>,
+        }
+
+        impl StreamTransport for FakeTransport {
+            fn transport_id(&self) -> TransportId {
+                self.id.clone()
+            }
+
+            fn start(
+                &self,
+                _provider: Arc<dyn StreamProvider>,
+            ) -> ambient_core::Result<tokio::task::JoinHandle<()>> {
+                let handle = tokio::runtime::Handle::current().spawn(async {});
+                Ok(handle)
+            }
+
+            fn stop(&self) -> ambient_core::Result<()> {
+                Ok(())
+            }
+
+            fn status(&self) -> TransportStatus {
+                TransportStatus {
+                    transport_id: self.id.clone(),
+                    state: TransportState::Active,
+                    peers: Vec::new(),
+                    last_event_at: None,
+                    events_ingested: 0,
+                }
+            }
+
+            fn on_push_notification(&self, _payload: Vec<u8>) -> ambient_core::Result<()> {
+                self.pushes.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        }
+
+        let pushes = Arc::new(AtomicUsize::new(0));
+        let transport = Arc::new(FakeTransport {
+            id: "cloudkit".to_string(),
+            pushes: pushes.clone(),
+        });
+        let registry = Arc::new(crate::TransportRegistry::from_transports(vec![transport]));
+
+        let store = Arc::new(MockKnowledgeStore::default());
+        let engine = Arc::new(MockQueryEngine::default());
+        let app = build_router(HttpAppState {
+            engine,
+            store,
+            auth_token: None,
+            status_probe: None,
+            deep_link_focus: Arc::new(Mutex::new(None)),
+            transport_registry: Some(registry),
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/transport/cloudkit/push")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"records":[{"id":"x"}]}"#))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        assert_eq!(pushes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn http_transport_push_route_returns_404_for_unknown_transport() {
+        let store = Arc::new(MockKnowledgeStore::default());
+        let engine = Arc::new(MockQueryEngine::default());
+        let app = build_router(HttpAppState {
+            engine,
+            store,
+            auth_token: None,
+            status_probe: None,
+            deep_link_focus: Arc::new(Mutex::new(None)),
+            transport_registry: Some(Arc::new(crate::TransportRegistry::default())),
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/transport/missing/push")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"records":[]}"#))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn http_transport_push_route_returns_500_on_transport_error() {
+        struct FailingTransport {
+            id: String,
+        }
+
+        impl StreamTransport for FailingTransport {
+            fn transport_id(&self) -> TransportId {
+                self.id.clone()
+            }
+
+            fn start(
+                &self,
+                _provider: Arc<dyn StreamProvider>,
+            ) -> ambient_core::Result<tokio::task::JoinHandle<()>> {
+                let handle = tokio::runtime::Handle::current().spawn(async {});
+                Ok(handle)
+            }
+
+            fn stop(&self) -> ambient_core::Result<()> {
+                Ok(())
+            }
+
+            fn status(&self) -> TransportStatus {
+                TransportStatus {
+                    transport_id: self.id.clone(),
+                    state: TransportState::Active,
+                    peers: Vec::new(),
+                    last_event_at: None,
+                    events_ingested: 0,
+                }
+            }
+
+            fn on_push_notification(&self, _payload: Vec<u8>) -> ambient_core::Result<()> {
+                Err(ambient_core::CoreError::Internal(
+                    "transport failure".to_string(),
+                ))
+            }
+        }
+
+        let registry = Arc::new(crate::TransportRegistry::from_transports(vec![Arc::new(
+            FailingTransport {
+                id: "cloudkit".to_string(),
+            },
+        )]));
+
+        let store = Arc::new(MockKnowledgeStore::default());
+        let engine = Arc::new(MockQueryEngine::default());
+        let app = build_router(HttpAppState {
+            engine,
+            store,
+            auth_token: None,
+            status_probe: None,
+            deep_link_focus: Arc::new(Mutex::new(None)),
+            transport_registry: Some(registry),
+        });
+
+        let req = Request::builder()
+            .method("POST")
+            .uri("/transport/cloudkit/push")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"records":[]}"#))
+            .expect("request");
+        let resp = app.oneshot(req).await.expect("response");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

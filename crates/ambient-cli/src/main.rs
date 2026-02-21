@@ -2,30 +2,67 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::{env, net::SocketAddr, path::PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use ambient_cli::{
-    run_doctor, run_http_server, run_setup, start_pulse_pipeline, AmbientConfig, DaemonSamplers,
-    DaemonStatusProbe, HttpAppState,
+    open_default_stream_provider, run_doctor, run_http_server, run_setup, AmbientConfig,
+    DaemonStatusProbe, HealthResponse, HttpAppState, PulseConsumer, TransportRegistry,
 };
-use ambient_core::{LoadAware, QueryResult, SourceAdapter, SpotlightExporter, SystemLoad};
-use ambient_menubar::{parse_ambient_deep_link, AmbientDeepLink};
-use ambient_normalizer::default_dispatch;
+use ambient_core::{
+    GatedFeature, License, LicenseError, LicenseGate, LoadAware, QueryResult, SpotlightExporter,
+    SystemLoad, TransportState,
+};
+use ambient_menubar::{parse_ambient_deep_link, start_native_runtime, AmbientDeepLink, MenubarController};
+use ambient_normalizer::{default_dispatch, NormalizerConsumer};
 use ambient_onboard::InMemoryCapabilityGate;
 use ambient_patterns::PatternScheduler;
 use ambient_query::build_runtime_components_with_weights;
 use ambient_reasoning::{EmbeddingQueue, RigReasoningEngine};
-use ambient_spotlight::{CoreSpotlightExporter, SpotlightAdapter};
+use ambient_spotlight::CoreSpotlightExporter;
 use ambient_triggers::TriggerEngine;
 use ambient_watcher::{
-    ActiveAppSampler, AudioInputSampler, ContextSwitchSampler, DefaultActiveAppProvider,
-    DefaultLoadPolicyProvider, LoadBroadcaster, ObsidianAdapter, SystemLoadSampler,
-    WatchAudioInputSource,
+    DefaultLoadPolicyProvider, LoadBroadcaster, SystemLoadSampler,
 };
 use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
 use serde::Serialize;
 use std::io::{self, Write};
 use uuid::Uuid;
+
+struct LocalLicenseGate {
+    license: License,
+}
+
+impl LocalLicenseGate {
+    fn from_env() -> Self {
+        match std::env::var("AMBIENT_LICENSE").ok().as_deref() {
+            Some("pro") => Self {
+                license: License::Pro {
+                    expires_at: chrono::Utc::now() + chrono::Duration::days(3650),
+                },
+            },
+            _ => Self {
+                license: License::Free,
+            },
+        }
+    }
+}
+
+impl LicenseGate for LocalLicenseGate {
+    fn is_pro(&self) -> bool {
+        matches!(self.license, License::Pro { .. })
+    }
+
+    fn check(&self, feature: GatedFeature) -> std::result::Result<(), LicenseError> {
+        match self.license {
+            License::Free => Err(LicenseError::ProRequired { feature }),
+            License::Pro { expires_at } if chrono::Utc::now() > expires_at => {
+                Err(LicenseError::Expired { expires_at })
+            }
+            License::Pro { .. } => Ok(()),
+        }
+    }
+}
 
 struct RuntimeStatusProbe {
     reasoning: Arc<RigReasoningEngine>,
@@ -34,6 +71,7 @@ struct RuntimeStatusProbe {
     upserted_units: Arc<AtomicU64>,
     active_sources: Vec<String>,
     active_samplers: Vec<String>,
+    transport_registry: Arc<TransportRegistry>,
 }
 
 impl DaemonStatusProbe for RuntimeStatusProbe {
@@ -60,10 +98,31 @@ impl DaemonStatusProbe for RuntimeStatusProbe {
     fn active_samplers(&self) -> Vec<String> {
         self.active_samplers.clone()
     }
+
+    fn transport_statuses(&self) -> Vec<ambient_core::TransportStatus> {
+        self.transport_registry.status_all()
+    }
 }
 
 struct RuntimeLoadTracker {
     state: std::sync::Mutex<SystemLoad>,
+}
+
+struct DaemonPidGuard {
+    path: PathBuf,
+}
+
+impl DaemonPidGuard {
+    fn create(path: PathBuf) -> Result<Self, String> {
+        write_daemon_pid(&path)?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for DaemonPidGuard {
+    fn drop(&mut self) {
+        let _ = remove_daemon_pid(&self.path);
+    }
 }
 
 impl RuntimeLoadTracker {
@@ -150,6 +209,11 @@ enum Commands {
     OpenUrl {
         url: String,
     },
+    CloudkitPush {
+        #[arg(long, default_value = "cloudkit")]
+        transport: String,
+        payload_file: PathBuf,
+    },
 }
 
 fn main() -> ExitCode {
@@ -169,12 +233,16 @@ fn run() -> Result<(), String> {
         Commands::Watch => {
             let config_path = default_config_path()?;
             let config = AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
+            let daemon_pid_path = default_daemon_pid_path()?;
+            let _pid_guard = DaemonPidGuard::create(daemon_pid_path)?;
             let (engine, store) =
                 build_runtime_components_with_weights(config.semantic_weight, config.feedback_weight)
                     .map_err(|e| e.to_string())?;
 
             let dispatch = Arc::new(default_dispatch());
             let spotlight_exporter = Arc::new(CoreSpotlightExporter::default());
+            let stream_provider = open_default_stream_provider().map_err(|e| e.to_string())?;
+            let transport_registry = Arc::new(TransportRegistry::from_config(&config));
             let reasoning = Arc::new(RigReasoningEngine::new(ambient_core::ReasoningBackend::Local {
                 ollama_base_url: "http://localhost:11434".to_string(),
             }));
@@ -189,18 +257,12 @@ fn run() -> Result<(), String> {
             let report_dir = default_report_dir()?;
             PatternScheduler::new(store.clone(), report_dir).start();
 
-            let (raw_tx, raw_rx) = std::sync::mpsc::channel();
-            let mut source_handles = Vec::new();
             let mut active_sources = vec!["obsidian".to_string()];
-            let obsidian = ObsidianAdapter::new(config.obsidian_vault.clone());
-            source_handles.push(obsidian.watch(raw_tx.clone()).map_err(|e| e.to_string())?);
-
             if config.spotlight {
-                let spotlight = SpotlightAdapter;
-                source_handles.push(spotlight.watch(raw_tx.clone()).map_err(|e| e.to_string())?);
                 active_sources.push("spotlight".to_string());
             }
 
+            let consume_provider = stream_provider.clone();
             let ingest_store = store.clone();
             let ingest_dispatch = dispatch.clone();
             let ingest_exporter = spotlight_exporter.clone();
@@ -209,17 +271,35 @@ fn run() -> Result<(), String> {
             let upserted_units = Arc::new(AtomicU64::new(0));
             let ingest_upserted_units = upserted_units.clone();
             std::thread::spawn(move || {
-                for raw in raw_rx {
-                    let Ok(unit) = ingest_dispatch.normalize(raw) else {
-                        continue;
+                let consumer = match NormalizerConsumer::new(
+                    consume_provider,
+                    ingest_store,
+                    ingest_dispatch,
+                    "normalizer".to_string(),
+                ) {
+                    Ok(consumer) => consumer,
+                    Err(_) => return,
+                };
+
+                loop {
+                    let units = match consumer.poll_once(100) {
+                        Ok(units) => units,
+                        Err(_) => {
+                            std::thread::sleep(Duration::from_millis(250));
+                            continue;
+                        }
                     };
-                    if ingest_store.upsert(unit.clone()).is_err() {
+                    if units.is_empty() {
+                        std::thread::sleep(Duration::from_millis(250));
                         continue;
                     }
-                    ingest_upserted_units.fetch_add(1, Ordering::Relaxed);
-                    let _ = ingest_exporter.export(&unit);
-                    let _ = ingest_queue.enqueue(unit.id, unit.content.clone());
-                    ingest_triggers.clone().on_upsert_background(unit);
+
+                    for unit in units {
+                        ingest_upserted_units.fetch_add(1, Ordering::Relaxed);
+                        let _ = ingest_exporter.export(&unit);
+                        let _ = ingest_queue.enqueue(unit.id, unit.content.clone());
+                        ingest_triggers.clone().on_upsert_background(unit);
+                    }
                 }
             });
 
@@ -231,7 +311,7 @@ fn run() -> Result<(), String> {
                 Arc::new(DefaultLoadPolicyProvider),
                 broadcaster.clone(),
             ));
-            let active_provider = Arc::new(DefaultActiveAppProvider);
+            let _system_load_handle = system_load.start().map_err(|e| e.to_string())?;
             let mut active_samplers = Vec::new();
             if config.context_switches {
                 active_samplers.push("context_switches".to_string());
@@ -242,55 +322,69 @@ fn run() -> Result<(), String> {
             if config.audio_input {
                 active_samplers.push("audio_input".to_string());
             }
-            let samplers = DaemonSamplers {
-                context_switch: if config.context_switches {
-                    Some(Arc::new(ContextSwitchSampler::new(active_provider.clone())))
-                } else {
-                    None
-                },
-                active_app: if config.active_app_titles {
-                    Some(Arc::new(ActiveAppSampler::new(active_provider)))
-                } else {
-                    None
-                },
-                audio_input: if config.audio_input {
-                    Some(Arc::new(AudioInputSampler::new(Arc::new(
-                        WatchAudioInputSource::new(false),
-                    ))))
-                } else {
-                    None
-                },
-            };
-            let _pulse_handles = start_pulse_pipeline(store.clone(), samplers, system_load, broadcaster)
-                .map_err(|e| e.to_string())?;
+            let pulse_provider = stream_provider.clone();
+            let pulse_store = store.clone();
+            std::thread::spawn(move || {
+                let consumer = match PulseConsumer::new(
+                    pulse_provider,
+                    pulse_store,
+                    "pulse".to_string(),
+                ) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                loop {
+                    let count = consumer.poll_once(200).unwrap_or(0);
+                    if count == 0 {
+                        std::thread::sleep(Duration::from_millis(250));
+                    }
+                }
+            });
 
             let addr: SocketAddr = format!("127.0.0.1:{}", config.http_port)
                 .parse()
                 .map_err(|e| format!("invalid server addr: {e}"))?;
 
+            let menubar_gate = Arc::new(LocalLicenseGate::from_env());
+            let menubar_controller = Arc::new(MenubarController::new(engine.clone(), menubar_gate));
+            let _menubar_runtime = if menubar_controller.startup_check() {
+                start_native_runtime(menubar_controller).ok()
+            } else {
+                None
+            };
+
             println!("ambient daemon listening on http://{addr}");
-            let _ = source_handles;
             let runtime = tokio::runtime::Runtime::new()
                 .map_err(|e| format!("failed to create tokio runtime: {e}"))?;
-            runtime
-                .block_on(run_http_server(
-                    addr,
-                    HttpAppState {
-                        engine,
-                        store,
-                        auth_token: config.auth_token.clone(),
-                        status_probe: Some(Arc::new(RuntimeStatusProbe {
-                            reasoning,
-                            embedding_queue,
-                            load_tracker,
-                            upserted_units,
-                            active_sources,
-                            active_samplers,
-                        })),
-                        deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
-                    },
-                ))
+            {
+                let _guard = runtime.enter();
+                transport_registry
+                    .start_all(stream_provider)
+                    .map_err(|e| format!("failed to start transport registry: {e}"))?;
+            }
+            let run_result = runtime.block_on(run_http_server(
+                addr,
+                HttpAppState {
+                    engine,
+                    store,
+                    auth_token: config.auth_token.clone(),
+                    status_probe: Some(Arc::new(RuntimeStatusProbe {
+                        reasoning,
+                        embedding_queue,
+                        load_tracker,
+                        upserted_units,
+                        active_sources,
+                        active_samplers,
+                        transport_registry: transport_registry.clone(),
+                    })),
+                    deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
+                    transport_registry: Some(transport_registry.clone()),
+                },
+            ));
+            let stop_result = transport_registry.stop_all().map_err(|e| e.to_string());
+            run_result
                 .map_err(|e| e.to_string())
+                .and(stop_result)
         }
         Commands::Query {
             text,
@@ -329,10 +423,16 @@ fn run() -> Result<(), String> {
             Ok(())
         }
         Commands::Doctor => {
-            let gate = Arc::new(InMemoryCapabilityGate::default());
-            gate.seed_defaults();
-            for line in run_doctor(gate) {
-                println!("{line}");
+            if let Some(lines) = fetch_transport_doctor(&cli.server, cli.token.as_deref())? {
+                for line in lines {
+                    println!("{line}");
+                }
+            } else {
+                let gate = Arc::new(InMemoryCapabilityGate::default());
+                gate.seed_defaults();
+                for line in run_doctor(gate) {
+                    println!("{line}");
+                }
             }
             Ok(())
         }
@@ -360,6 +460,19 @@ fn run() -> Result<(), String> {
         }
         Commands::Export { format } => export_data(&cli.server, cli.token.as_deref(), &format),
         Commands::OpenUrl { url } => open_url(&cli.server, cli.token.as_deref(), &url),
+        Commands::CloudkitPush {
+            transport,
+            payload_file,
+        } => {
+            let payload = std::fs::read_to_string(&payload_file)
+                .map_err(|e| format!("failed reading payload file {}: {e}", payload_file.display()))?;
+            post_raw_json(
+                &cli.server,
+                cli.token.as_deref(),
+                &format!("/transport/{transport}/push"),
+                payload,
+            )
+        }
     }
 }
 
@@ -376,6 +489,27 @@ fn default_triggers_path() -> Result<PathBuf, String> {
 fn default_report_dir() -> Result<PathBuf, String> {
     let home = env::var("HOME").map_err(|e| format!("failed to resolve HOME: {e}"))?;
     Ok(PathBuf::from(home).join(".ambient").join("reports"))
+}
+
+fn default_daemon_pid_path() -> Result<PathBuf, String> {
+    let home = env::var("HOME").map_err(|e| format!("failed to resolve HOME: {e}"))?;
+    Ok(PathBuf::from(home).join(".ambient").join("daemon.pid"))
+}
+
+fn write_daemon_pid(path: &PathBuf) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("failed to create daemon pid dir: {e}"))?;
+    }
+    let pid = std::process::id();
+    std::fs::write(path, pid.to_string()).map_err(|e| format!("failed to write daemon pid: {e}"))
+}
+
+fn remove_daemon_pid(path: &PathBuf) -> Result<(), String> {
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| format!("failed to remove daemon pid: {e}"))?;
+    }
+    Ok(())
 }
 
 fn get(server: &str, token: Option<&str>, path: &str) -> Result<(), String> {
@@ -398,6 +532,20 @@ fn post_json<T: Serialize>(
     let url = format!("{}{}", server.trim_end_matches('/'), path);
     let client = Client::new();
     let mut req = client.post(url).json(payload);
+    if let Some(token) = token {
+        req = req.header("X-Ambient-Token", token);
+    }
+    let response = req.send().map_err(|e| format!("request failed: {e}"))?;
+    print_response(response)
+}
+
+fn post_raw_json(server: &str, token: Option<&str>, path: &str, payload: String) -> Result<(), String> {
+    let url = format!("{}{}", server.trim_end_matches('/'), path);
+    let client = Client::new();
+    let mut req = client
+        .post(url)
+        .header("content-type", "application/json")
+        .body(payload);
     if let Some(token) = token {
         req = req.header("X-Ambient-Token", token);
     }
@@ -492,4 +640,50 @@ fn open_url(server: &str, token: Option<&str>, url: &str) -> Result<(), String> 
             get(server, token, &format!("/unit/{id}"))
         }
     }
+}
+
+fn fetch_transport_doctor(server: &str, token: Option<&str>) -> Result<Option<Vec<String>>, String> {
+    let url = format!("{}/health", server.trim_end_matches('/'));
+    let client = Client::new();
+    let mut req = client.get(url);
+    if let Some(token) = token {
+        req = req.header("X-Ambient-Token", token);
+    }
+
+    let Ok(resp) = req.send() else {
+        return Ok(None);
+    };
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    let body = resp
+        .text()
+        .map_err(|e| format!("failed reading /health response: {e}"))?;
+    let parsed: HealthResponse = serde_json::from_str(&body)
+        .map_err(|e| format!("invalid /health payload: {e}"))?;
+
+    let mut out = Vec::new();
+    out.push("Transport Status".to_string());
+    out.push("────────────────────────────────────────────────────────────".to_string());
+    if parsed.transport_statuses.is_empty() {
+        out.push("No transport status reported".to_string());
+        return Ok(Some(out));
+    }
+
+    for status in parsed.transport_statuses {
+        let state = match status.state {
+            TransportState::Active => "Active".to_string(),
+            TransportState::Inactive => "Inactive".to_string(),
+            TransportState::Degraded { reason } => format!("Degraded ({reason})"),
+            TransportState::RequiresSetup { action } => format!("Requires setup ({action:?})"),
+        };
+        out.push(format!(
+            "{}  {} events={} peers={}",
+            status.transport_id,
+            state,
+            status.events_ingested,
+            status.peers.len()
+        ));
+    }
+    Ok(Some(out))
 }

@@ -3,6 +3,12 @@ resolver = "2"
 members = [
   "crates/tsink",
   "crates/ambient-core",
+  "crates/ambient-stream",
+  "crates/ambient-transport-local",
+  "crates/ambient-transport-bonjour",
+  "crates/ambient-transport-cloudkit",
+  "crates/ambient-transport-google-health",
+  "crates/ambient-recorder",
   "crates/ambient-watcher",
   "crates/ambient-normalizer",
   "crates/ambient-store",

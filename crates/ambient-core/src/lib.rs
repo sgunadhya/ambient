@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use bytes::Bytes;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
@@ -77,6 +78,26 @@ pub enum RawPayload {
         mood: u8,
         note: Option<String>,
         reported_at: DateTime<Utc>,
+    },
+    BehavioralSummary {
+        period_start: DateTime<Utc>,
+        period_end: DateTime<Utc>,
+        avg_context_switch_rate: f32,
+        peak_context_switch_rate: f32,
+        audio_active_seconds: u32,
+        dominant_app: Option<String>,
+        app_switch_count: u32,
+        was_in_meeting: bool,
+        was_in_focus_block: bool,
+        device_origin: String,
+    },
+    KnowledgeUnitSync {
+        unit: Box<KnowledgeUnit>,
+        device_origin: String,
+    },
+    FeedbackEventSync {
+        event: Box<FeedbackEvent>,
+        device_origin: String,
     },
 }
 
@@ -277,6 +298,44 @@ pub struct WatchHandle;
 #[derive(Debug, Clone, Default)]
 pub struct SamplerHandle;
 
+pub type Offset = u64;
+pub type ConsumerId = String;
+pub type TransportId = String;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum EventLogEntry {
+    Raw(RawEvent),
+    Pulse(PulseEvent),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransportStatus {
+    pub transport_id: TransportId,
+    pub state: TransportState,
+    pub peers: Vec<PeerStatus>,
+    pub last_event_at: Option<DateTime<Utc>>,
+    pub events_ingested: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TransportState {
+    Active,
+    Degraded { reason: String },
+    Inactive,
+    RequiresSetup { action: SetupAction },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerStatus {
+    pub peer_id: String,
+    pub device_name: String,
+    pub last_seen: DateTime<Utc>,
+    pub events_received: u64,
+    pub reachable: bool,
+}
+
 pub trait SourceAdapter: Send + Sync {
     fn source_id(&self) -> SourceId;
     fn watch(&self, tx: Sender<RawEvent>) -> Result<WatchHandle>;
@@ -307,6 +366,19 @@ pub trait KnowledgeStore: Send + Sync {
         context_window_secs: u64,
     ) -> Result<Option<(KnowledgeUnit, Vec<PulseEvent>, CognitiveState)>>;
 
+    fn unit_with_context_fast(&self, id: Uuid) -> Result<Option<(KnowledgeUnit, CognitiveState)>> {
+        self.unit_with_context(id, 120)
+            .map(|opt| opt.map(|(unit, _, state)| (unit, state)))
+    }
+
+    fn unit_with_context_live(
+        &self,
+        id: Uuid,
+        window_secs: u64,
+    ) -> Result<Option<(KnowledgeUnit, Vec<PulseEvent>, CognitiveState)>> {
+        self.unit_with_context(id, window_secs)
+    }
+
     fn record_feedback(&self, event: FeedbackEvent) -> Result<()>;
     fn feedback_score(&self, unit_id: Uuid) -> Result<f32>;
     fn pattern_feedback(&self, pattern_id: Uuid) -> Result<Option<String>>;
@@ -317,8 +389,116 @@ pub trait ReasoningEngine: Send + Sync {
     fn answer(&self, question: &str, context: &[KnowledgeUnit]) -> Result<String>;
 }
 
+pub fn derive_cognitive_state(observed_at: DateTime<Utc>, pulse: &[PulseEvent]) -> CognitiveState {
+    let mut context_sum = 0.0f32;
+    let mut context_count = 0usize;
+    let mut was_on_call = false;
+    let mut app_counts: HashMap<String, usize> = HashMap::new();
+    let mut was_in_meeting = false;
+    let mut was_in_focus_block = false;
+    let mut energy_level = None;
+    let mut mood_level = None;
+    let mut hrv_score = None;
+    let mut sleep_quality = None;
+    let mut minutes_until_next = None;
+
+    for event in pulse {
+        match &event.signal {
+            PulseSignal::ContextSwitchRate {
+                switches_per_minute,
+            } => {
+                context_sum += switches_per_minute;
+                context_count += 1;
+            }
+            PulseSignal::ActiveApp { bundle_id, .. } => {
+                *app_counts.entry(bundle_id.clone()).or_insert(0) += 1;
+            }
+            PulseSignal::AudioInputActive { active } => {
+                if *active {
+                    was_on_call = true;
+                }
+            }
+            PulseSignal::CalendarContext {
+                in_meeting,
+                in_focus_block,
+                minutes_until_next_event,
+                ..
+            } => {
+                was_in_meeting |= *in_meeting;
+                was_in_focus_block |= *in_focus_block;
+                minutes_until_next = *minutes_until_next_event;
+            }
+            PulseSignal::EnergyLevel { score } => energy_level = Some(*score),
+            PulseSignal::MoodLevel { score } => mood_level = Some(*score),
+            PulseSignal::HRVScore { value } => hrv_score = Some(*value),
+            PulseSignal::SleepQuality { score } => sleep_quality = Some(*score),
+            PulseSignal::TimeContext { .. } => {}
+        }
+    }
+
+    let avg_switch_rate = if context_count == 0 {
+        f32::INFINITY
+    } else {
+        context_sum / context_count as f32
+    };
+
+    let dominant_app = app_counts
+        .into_iter()
+        .max_by_key(|(_, count)| *count)
+        .map(|(bundle, _)| bundle);
+
+    CognitiveState {
+        was_in_flow: avg_switch_rate < 2.0,
+        was_on_call,
+        dominant_app,
+        time_of_day: Some(observed_at.hour() as u8),
+        was_in_meeting,
+        was_in_focus_block,
+        energy_level,
+        mood_level,
+        hrv_score,
+        sleep_quality,
+        minutes_since_last_meeting: minutes_until_next,
+    }
+}
+
 pub trait QueryEngine: Send + Sync {
     fn query(&self, req: QueryRequest) -> Result<Vec<QueryResult>>;
+}
+
+pub trait StreamProvider: Send + Sync {
+    fn append_raw(&self, event: RawEvent) -> Result<Offset>;
+    fn append_pulse(&self, event: PulseEvent) -> Result<Offset>;
+    fn append_raw_from(&self, event: RawEvent, transport: &str, record_id: &str) -> Result<Offset>;
+    fn read(
+        &self,
+        consumer: &ConsumerId,
+        from: Offset,
+        limit: usize,
+    ) -> Result<Vec<(Offset, EventLogEntry)>>;
+    fn commit(&self, consumer: &ConsumerId, offset: Offset) -> Result<()>;
+    fn last_committed(&self, consumer: &ConsumerId) -> Result<Option<Offset>>;
+    fn subscribe(
+        &self,
+        consumer: &ConsumerId,
+        tx: tokio::sync::watch::Sender<Offset>,
+    ) -> Result<()>;
+}
+
+pub trait StreamTransport: Send + Sync {
+    fn transport_id(&self) -> TransportId;
+    fn start(&self, provider: Arc<dyn StreamProvider>) -> Result<tokio::task::JoinHandle<()>>;
+    fn stop(&self) -> Result<()>;
+    fn status(&self) -> TransportStatus;
+    fn save_state(&self) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+    fn load_state(&self, _state: &[u8]) -> Result<()> {
+        Ok(())
+    }
+    fn on_push_notification(&self, _payload: Vec<u8>) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub trait SpotlightExporter: Send + Sync {
@@ -413,11 +593,13 @@ pub mod mocks {
     use uuid::Uuid;
 
     use crate::{
-        CapabilityGate, CapabilityStatus, CognitiveState, CoreError, ExternalDependency, FeedbackEvent,
-        GatedCapability, GatedFeature, KnowledgeStore, LicenseError, LicenseGate, LoadAware,
-        Normalizer, PulseEvent, PulseSampler, QueryEngine, QueryRequest, QueryResult, RawEvent,
-        RawPayload, ReasoningEngine, Result, SamplerHandle, SourceAdapter, SourceId,
-        SpotlightExporter, SystemLoad, TriggerAction, TriggerCondition, WatchHandle,
+        CapabilityGate, CapabilityStatus, CognitiveState, ConsumerId, CoreError, EventLogEntry,
+        ExternalDependency, FeedbackEvent, GatedCapability, GatedFeature, KnowledgeStore,
+        LicenseError, LicenseGate, LoadAware, Normalizer, Offset, PeerStatus, PulseEvent,
+        PulseSampler, QueryEngine, QueryRequest, QueryResult, RawEvent, RawPayload, ReasoningEngine,
+        Result, SamplerHandle, SourceAdapter, SourceId, SpotlightExporter, StreamProvider,
+        StreamTransport, SystemLoad, TransportState, TransportStatus, TriggerAction, TriggerCondition,
+        WatchHandle,
     };
 
     #[derive(Debug, Clone)]
@@ -736,6 +918,232 @@ pub mod mocks {
                 .lock()
                 .map_err(|_| CoreError::Internal("results lock poisoned".to_string()))?
                 .clone())
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct StreamProviderCall {
+        pub method: String,
+    }
+
+    #[derive(Default)]
+    pub struct MockStreamProvider {
+        pub entries: Mutex<Vec<(Offset, EventLogEntry)>>,
+        pub committed: Mutex<HashMap<ConsumerId, Offset>>,
+        pub record_ids: Mutex<HashMap<String, Offset>>,
+        pub subscribers: Mutex<HashMap<ConsumerId, tokio::sync::watch::Sender<Offset>>>,
+        pub calls: Mutex<Vec<StreamProviderCall>>,
+    }
+
+    impl StreamProvider for MockStreamProvider {
+        fn append_raw(&self, event: RawEvent) -> Result<Offset> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "append_raw".to_string(),
+                });
+            }
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| CoreError::Internal("entries lock poisoned".to_string()))?;
+            let next = (entries.len() as Offset) + 1;
+            entries.push((next, EventLogEntry::Raw(event)));
+            drop(entries);
+            self.notify_subscribers(next);
+            Ok(next)
+        }
+
+        fn append_pulse(&self, event: PulseEvent) -> Result<Offset> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "append_pulse".to_string(),
+                });
+            }
+            let mut entries = self
+                .entries
+                .lock()
+                .map_err(|_| CoreError::Internal("entries lock poisoned".to_string()))?;
+            let next = (entries.len() as Offset) + 1;
+            entries.push((next, EventLogEntry::Pulse(event)));
+            drop(entries);
+            self.notify_subscribers(next);
+            Ok(next)
+        }
+
+        fn append_raw_from(&self, event: RawEvent, _transport: &str, record_id: &str) -> Result<Offset> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "append_raw_from".to_string(),
+                });
+            }
+            if let Some(existing) = self
+                .record_ids
+                .lock()
+                .map_err(|_| CoreError::Internal("record ids lock poisoned".to_string()))?
+                .get(record_id)
+                .copied()
+            {
+                return Ok(existing);
+            }
+            let offset = self.append_raw(event)?;
+            self.record_ids
+                .lock()
+                .map_err(|_| CoreError::Internal("record ids lock poisoned".to_string()))?
+                .insert(record_id.to_string(), offset);
+            Ok(offset)
+        }
+
+        fn read(
+            &self,
+            _consumer: &ConsumerId,
+            from: Offset,
+            limit: usize,
+        ) -> Result<Vec<(Offset, EventLogEntry)>> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "read".to_string(),
+                });
+            }
+            Ok(self
+                .entries
+                .lock()
+                .map_err(|_| CoreError::Internal("entries lock poisoned".to_string()))?
+                .iter()
+                .filter(|(offset, _)| *offset > from)
+                .take(limit)
+                .cloned()
+                .collect())
+        }
+
+        fn commit(&self, consumer: &ConsumerId, offset: Offset) -> Result<()> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "commit".to_string(),
+                });
+            }
+            self.committed
+                .lock()
+                .map_err(|_| CoreError::Internal("committed lock poisoned".to_string()))?
+                .insert(consumer.clone(), offset);
+            Ok(())
+        }
+
+        fn last_committed(&self, consumer: &ConsumerId) -> Result<Option<Offset>> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "last_committed".to_string(),
+                });
+            }
+            Ok(self
+                .committed
+                .lock()
+                .map_err(|_| CoreError::Internal("committed lock poisoned".to_string()))?
+                .get(consumer)
+                .copied())
+        }
+
+        fn subscribe(
+            &self,
+            consumer: &ConsumerId,
+            tx: tokio::sync::watch::Sender<Offset>,
+        ) -> Result<()> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamProviderCall {
+                    method: "subscribe".to_string(),
+                });
+            }
+            self.subscribers
+                .lock()
+                .map_err(|_| CoreError::Internal("subscribers lock poisoned".to_string()))?
+                .insert(consumer.clone(), tx);
+            Ok(())
+        }
+    }
+
+    impl MockStreamProvider {
+        fn notify_subscribers(&self, offset: Offset) {
+            let subscribers = match self.subscribers.lock() {
+                Ok(guard) => guard.values().cloned().collect::<Vec<_>>(),
+                Err(_) => return,
+            };
+            for tx in subscribers {
+                let _ = tx.send(offset);
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct StreamTransportCall {
+        pub method: String,
+    }
+
+    pub struct MockStreamTransport {
+        pub id: String,
+        pub calls: Mutex<Vec<StreamTransportCall>>,
+    }
+
+    impl Default for MockStreamTransport {
+        fn default() -> Self {
+            Self {
+                id: "mock-transport".to_string(),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl StreamTransport for MockStreamTransport {
+        fn transport_id(&self) -> String {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamTransportCall {
+                    method: "transport_id".to_string(),
+                });
+            }
+            self.id.clone()
+        }
+
+        fn start(
+            &self,
+            _provider: std::sync::Arc<dyn StreamProvider>,
+        ) -> Result<tokio::task::JoinHandle<()>> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamTransportCall {
+                    method: "start".to_string(),
+                });
+            }
+            let handle = tokio::runtime::Handle::try_current()
+                .map_err(|e| CoreError::Internal(format!("tokio runtime unavailable: {e}")))?
+                .spawn(async {});
+            Ok(handle)
+        }
+
+        fn stop(&self) -> Result<()> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamTransportCall {
+                    method: "stop".to_string(),
+                });
+            }
+            Ok(())
+        }
+
+        fn status(&self) -> TransportStatus {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(StreamTransportCall {
+                    method: "status".to_string(),
+                });
+            }
+            TransportStatus {
+                transport_id: self.id.clone(),
+                state: TransportState::Active,
+                peers: vec![PeerStatus {
+                    peer_id: "peer".to_string(),
+                    device_name: "Mock Device".to_string(),
+                    last_seen: Utc::now(),
+                    events_received: 0,
+                    reachable: true,
+                }],
+                last_event_at: None,
+                events_ingested: 0,
+            }
         }
     }
 

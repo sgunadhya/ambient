@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ambient_core::{
-    CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore, KnowledgeUnit,
-    PulseEvent, PulseSignal, Result,
+    derive_cognitive_state, CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore,
+    KnowledgeUnit, PulseEvent, PulseSignal, Result,
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
@@ -27,6 +27,7 @@ pub struct LadybugStore {
     units: Mutex<HashMap<Uuid, KnowledgeUnit>>,
     hash_index: Mutex<HashMap<[u8; 32], Uuid>>,
     links: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
+    snapshots: Mutex<HashMap<Uuid, CognitiveState>>,
     feedback: Mutex<Vec<FeedbackEvent>>,
     pulse_storage: tsink::Storage,
 }
@@ -51,6 +52,7 @@ impl LadybugStore {
             units: Mutex::new(HashMap::new()),
             hash_index: Mutex::new(HashMap::new()),
             links: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
             feedback: Mutex::new(Vec::new()),
             pulse_storage,
         };
@@ -89,6 +91,23 @@ impl LadybugStore {
     query_text: String?,
     action: String?,
     pattern_id: String?
+}
+:create cognitive_snapshots {
+    unit_id: String =>
+    observed_at: Float,
+    window_secs: Int,
+    was_in_flow: Bool,
+    was_on_call: Bool,
+    dominant_app: String?,
+    time_of_day: Int,
+    context_switch_rate: Float,
+    was_in_meeting: Bool,
+    was_in_focus_block: Bool,
+    energy_level: Int?,
+    mood_level: Int?,
+    hrv_score: Float?,
+    sleep_quality: Float?,
+    minutes_since_last_meeting: Int?
 }
 "#;
 
@@ -135,6 +154,87 @@ impl LadybugStore {
         let script = r#"
 ?[from_id, to_id, link_type] <- [[ $from_id, $to_id, $link_type ]]
 :put links { from_id, to_id => link_type }
+"#;
+        let _ = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Mutable);
+    }
+
+    fn cozo_put_snapshot(
+        &self,
+        unit: &KnowledgeUnit,
+        window_secs: i64,
+        state: &CognitiveState,
+        context_switch_rate: f64,
+    ) {
+        let mut params = BTreeMap::new();
+        params.insert("unit_id".to_string(), DataValue::from(unit.id.to_string()));
+        params.insert(
+            "observed_at".to_string(),
+            DataValue::from(unit.observed_at.timestamp_millis() as f64),
+        );
+        params.insert("window_secs".to_string(), DataValue::from(window_secs));
+        params.insert("was_in_flow".to_string(), DataValue::from(state.was_in_flow));
+        params.insert("was_on_call".to_string(), DataValue::from(state.was_on_call));
+        params.insert(
+            "dominant_app".to_string(),
+            state
+                .dominant_app
+                .clone()
+                .map(DataValue::from)
+                .unwrap_or(DataValue::Null),
+        );
+        params.insert(
+            "time_of_day".to_string(),
+            DataValue::from(state.time_of_day.unwrap_or(0) as i64),
+        );
+        params.insert("context_switch_rate".to_string(), DataValue::from(context_switch_rate));
+        params.insert("was_in_meeting".to_string(), DataValue::from(state.was_in_meeting));
+        params.insert(
+            "was_in_focus_block".to_string(),
+            DataValue::from(state.was_in_focus_block),
+        );
+        params.insert(
+            "energy_level".to_string(),
+            state
+                .energy_level
+                .map(|v| DataValue::from(v as i64))
+                .unwrap_or(DataValue::Null),
+        );
+        params.insert(
+            "mood_level".to_string(),
+            state
+                .mood_level
+                .map(|v| DataValue::from(v as i64))
+                .unwrap_or(DataValue::Null),
+        );
+        params.insert(
+            "hrv_score".to_string(),
+            state
+                .hrv_score
+                .map(|v| DataValue::from(v as f64))
+                .unwrap_or(DataValue::Null),
+        );
+        params.insert(
+            "sleep_quality".to_string(),
+            state
+                .sleep_quality
+                .map(|v| DataValue::from(v as f64))
+                .unwrap_or(DataValue::Null),
+        );
+        params.insert(
+            "minutes_since_last_meeting".to_string(),
+            state
+                .minutes_since_last_meeting
+                .map(|v| DataValue::from(v as i64))
+                .unwrap_or(DataValue::Null),
+        );
+
+        let script = r#"
+?[unit_id, observed_at, window_secs, was_in_flow, was_on_call, dominant_app, time_of_day, context_switch_rate, was_in_meeting, was_in_focus_block, energy_level, mood_level, hrv_score, sleep_quality, minutes_since_last_meeting] <- [[
+  $unit_id, $observed_at, $window_secs, $was_in_flow, $was_on_call, $dominant_app, $time_of_day, $context_switch_rate, $was_in_meeting, $was_in_focus_block, $energy_level, $mood_level, $hrv_score, $sleep_quality, $minutes_since_last_meeting
+]]
+:put cognitive_snapshots { unit_id => observed_at, window_secs, was_in_flow, was_on_call, dominant_app, time_of_day, context_switch_rate, was_in_meeting, was_in_focus_block, energy_level, mood_level, hrv_score, sleep_quality, minutes_since_last_meeting }
 "#;
         let _ = self
             .cozo
@@ -415,63 +515,6 @@ impl LadybugStore {
         }
     }
 
-    fn derive_cognitive_state(unit: &KnowledgeUnit, pulse: &[PulseEvent]) -> CognitiveState {
-        let mut context_sum = 0.0f32;
-        let mut context_count = 0usize;
-        let mut was_on_call = false;
-        let mut app_counts: HashMap<String, usize> = HashMap::new();
-
-        for event in pulse {
-            match &event.signal {
-                PulseSignal::ContextSwitchRate {
-                    switches_per_minute,
-                } => {
-                    context_sum += switches_per_minute;
-                    context_count += 1;
-                }
-                PulseSignal::ActiveApp { bundle_id, .. } => {
-                    *app_counts.entry(bundle_id.clone()).or_insert(0) += 1;
-                }
-                PulseSignal::AudioInputActive { active } => {
-                    if *active {
-                        was_on_call = true;
-                    }
-                }
-                PulseSignal::TimeContext { .. }
-                | PulseSignal::CalendarContext { .. }
-                | PulseSignal::EnergyLevel { .. }
-                | PulseSignal::MoodLevel { .. }
-                | PulseSignal::HRVScore { .. }
-                | PulseSignal::SleepQuality { .. } => {}
-            }
-        }
-
-        let avg_switch_rate = if context_count == 0 {
-            f32::INFINITY
-        } else {
-            context_sum / context_count as f32
-        };
-
-        let dominant_app = app_counts
-            .into_iter()
-            .max_by_key(|(_, count)| *count)
-            .map(|(bundle, _)| bundle);
-
-        CognitiveState {
-            was_in_flow: avg_switch_rate < 2.0,
-            was_on_call,
-            dominant_app,
-            time_of_day: Some(unit.observed_at.hour() as u8),
-            was_in_meeting: false,
-            was_in_focus_block: false,
-            energy_level: None,
-            mood_level: None,
-            hrv_score: None,
-            sleep_quality: None,
-            minutes_since_last_meeting: None,
-        }
-    }
-
     fn index_links(&self, unit: &KnowledgeUnit) -> Result<()> {
         let mut title_to_id = HashMap::new();
         {
@@ -532,6 +575,33 @@ impl KnowledgeStore for LadybugStore {
 
         // TimeContext is derived at ingestion time from observed_at.
         self.record_pulse(Self::derive_time_context(unit.observed_at))?;
+        let window_secs = 120i64;
+        let from = unit.observed_at - chrono::Duration::seconds(window_secs);
+        let to = unit.observed_at + chrono::Duration::seconds(window_secs);
+        if let Ok(pulse) = self.pulse_window(from, to) {
+            let state = derive_cognitive_state(unit.observed_at, &pulse);
+            let (sum, count) = pulse.iter().fold((0.0f64, 0usize), |acc, event| {
+                match event.signal {
+                    PulseSignal::ContextSwitchRate {
+                        switches_per_minute,
+                    } => (acc.0 + switches_per_minute as f64, acc.1 + 1),
+                    PulseSignal::ActiveApp { .. }
+                    | PulseSignal::AudioInputActive { .. }
+                    | PulseSignal::TimeContext { .. }
+                    | PulseSignal::CalendarContext { .. }
+                    | PulseSignal::EnergyLevel { .. }
+                    | PulseSignal::MoodLevel { .. }
+                    | PulseSignal::HRVScore { .. }
+                    | PulseSignal::SleepQuality { .. } => acc,
+                }
+            });
+            let avg_switch = if count == 0 { 0.0 } else { sum / count as f64 };
+            self.cozo_put_snapshot(&unit, window_secs, &state, avg_switch);
+            let _ = self
+                .snapshots
+                .lock()
+                .map(|mut snapshots| snapshots.insert(unit.id, state));
+        }
         Ok(())
     }
 
@@ -662,9 +732,37 @@ impl KnowledgeStore for LadybugStore {
         let from = unit.observed_at - chrono::Duration::seconds(context_window_secs as i64);
         let to = unit.observed_at + chrono::Duration::seconds(context_window_secs as i64);
         let pulse = self.pulse_window(from, to)?;
-        let state = Self::derive_cognitive_state(&unit, &pulse);
+        let state = derive_cognitive_state(unit.observed_at, &pulse);
 
         Ok(Some((unit, pulse, state)))
+    }
+
+    fn unit_with_context_fast(&self, id: Uuid) -> Result<Option<(KnowledgeUnit, CognitiveState)>> {
+        let Some(unit) = self.get_by_id(id)? else {
+            return Ok(None);
+        };
+        if let Some(state) = self
+            .snapshots
+            .lock()
+            .map_err(|_| CoreError::Internal("snapshots lock poisoned".to_string()))?
+            .get(&id)
+            .cloned()
+        {
+            return Ok(Some((unit, state)));
+        }
+        let from = unit.observed_at - chrono::Duration::seconds(120);
+        let to = unit.observed_at + chrono::Duration::seconds(120);
+        let pulse = self.pulse_window(from, to)?;
+        let state = derive_cognitive_state(unit.observed_at, &pulse);
+        Ok(Some((unit, state)))
+    }
+
+    fn unit_with_context_live(
+        &self,
+        id: Uuid,
+        window_secs: u64,
+    ) -> Result<Option<(KnowledgeUnit, Vec<PulseEvent>, CognitiveState)>> {
+        self.unit_with_context(id, window_secs)
     }
 
     fn record_feedback(&self, event: FeedbackEvent) -> Result<()> {

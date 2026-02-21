@@ -4,7 +4,7 @@
 
 A macOS background daemon written in Rust that:
 1. Watches multiple knowledge sources (Obsidian, Apple Notes, filesystem, and anything Spotlight has already indexed) for changes
-2. Samples cognitive context signals (active app, keystroke density, context switches, audio state) via tsink
+2. Samples cognitive context signals (active app, context switches, audio state) via tsink
 3. Normalizes knowledge content into a canonical `KnowledgeUnit` representation
 4. Stores a persistent property graph + vector knowledge base via LadybugDB (embedded, in-process)
 5. Correlates knowledge units with cognitive context windows from tsink at query time
@@ -663,7 +663,6 @@ Work strictly in this order. Do not implement a later phase until the current ph
 
 ### Phase 2 — Pulse
 - [ ] Implement `ContextSwitchSampler` and `ActiveAppSampler` in `ambient-watcher`
-- [ ] Implement `KeystrokeDensitySampler` (event count only, no content)
 - [ ] Implement `AudioInputSampler`
 - [ ] Integrate `tsink` into `ambient-store`, implement `record_pulse` and `pulse_window`
 - [ ] Implement `unit_with_context` correlated query

@@ -937,6 +937,6 @@ Add to the coding conventions in CLAUDE.md:
 - Session prompts 1, 2, 3 — unchanged (scaffold, ambient-core, Phase 1)
 - Session prompt 4 (Phase 2 Pulse) — unchanged
 - Battery gate requirement — unchanged
-- Privacy rules for ActiveAppSampler and KeystrokeDensity removal — unchanged
+- Privacy rules for ActiveAppSampler and keystroke sampling removal — unchanged
 - All objc2 usage conventions — unchanged
 - ambient-menubar and ambient-cli dependency rules — unchanged

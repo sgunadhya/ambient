@@ -693,6 +693,9 @@ mod macos_bridge {
     #[cfg(target_os = "macos")]
     #[link(name = "AppKit", kind = "framework")]
     unsafe extern "C" {}
+    #[cfg(target_os = "macos")]
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {}
 
     #[cfg(target_os = "macos")]
     pub fn frontmost_bundle_id() -> Option<String> {
@@ -732,11 +735,82 @@ mod macos_bridge {
 
     #[cfg(target_os = "macos")]
     pub fn frontmost_window_title() -> Option<String> {
-        use objc2::rc::autoreleasepool;
+        use std::ffi::c_void;
+        use std::ptr;
 
-        // AXUIElement integration will be used for this path; currently gated by allowlist
-        // and timeout at caller side. Keep this call inside autoreleasepool.
-        autoreleasepool(|_| None)
+        use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
+        use core_foundation::string::{CFString, CFStringRef};
+        use objc2::rc::autoreleasepool;
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+
+        type AXUIElementRef = *const c_void;
+        type AXError = i32;
+
+        unsafe extern "C" {
+            fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+            fn AXUIElementCopyAttributeValue(
+                element: AXUIElementRef,
+                attribute: CFStringRef,
+                value: *mut CFTypeRef,
+            ) -> AXError;
+        }
+
+        autoreleasepool(|_| {
+            let workspace: *mut AnyObject = unsafe { msg_send![class!(NSWorkspace), sharedWorkspace] };
+            if workspace.is_null() {
+                return None;
+            }
+            let app: *mut AnyObject = unsafe { msg_send![workspace, frontmostApplication] };
+            if app.is_null() {
+                return None;
+            }
+            let pid: i32 = unsafe { msg_send![app, processIdentifier] };
+            if pid <= 0 {
+                return None;
+            }
+
+            let app_el = unsafe { AXUIElementCreateApplication(pid) };
+            if app_el.is_null() {
+                return None;
+            }
+
+            let focused_window_attr = CFString::new("AXFocusedWindow");
+            let mut window_value: CFTypeRef = ptr::null();
+            let window_status = unsafe {
+                AXUIElementCopyAttributeValue(
+                    app_el,
+                    focused_window_attr.as_concrete_TypeRef(),
+                    &mut window_value,
+                )
+            };
+            unsafe {
+                CFRelease(app_el.cast_mut());
+            }
+            if window_status != 0 || window_value.is_null() {
+                return None;
+            }
+
+            let title_attr = CFString::new("AXTitle");
+            let mut title_value: CFTypeRef = ptr::null();
+            let title_status = unsafe {
+                AXUIElementCopyAttributeValue(
+                    window_value.cast(),
+                    title_attr.as_concrete_TypeRef(),
+                    &mut title_value,
+                )
+            };
+            unsafe {
+                CFRelease(window_value.cast_mut());
+            }
+            if title_status != 0 || title_value.is_null() {
+                return None;
+            }
+
+            let title =
+                unsafe { CFString::wrap_under_create_rule(title_value as CFStringRef).to_string() };
+            Some(title)
+        })
     }
 
     #[cfg(not(target_os = "macos"))]

@@ -65,6 +65,9 @@ pub struct MenubarController {
     debounce: Duration,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct MenubarRuntimeHandle;
+
 impl MenubarController {
     pub fn new(engine: Arc<dyn QueryEngine>, gate: Arc<dyn LicenseGate>) -> Self {
         Self {
@@ -211,6 +214,19 @@ impl MenubarController {
     }
 }
 
+pub fn start_native_runtime(controller: Arc<MenubarController>) -> Result<MenubarRuntimeHandle> {
+    #[cfg(target_os = "macos")]
+    {
+        return macos_runtime::start(controller);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = controller;
+        Ok(MenubarRuntimeHandle)
+    }
+}
+
 pub fn badge_for(result: &QueryResult) -> Vec<&'static str> {
     let mut badges = Vec::new();
     if let Some(state) = &result.cognitive_state {
@@ -230,6 +246,74 @@ pub fn badge_for(result: &QueryResult) -> Vec<&'static str> {
         }
     }
     badges
+}
+
+#[cfg(target_os = "macos")]
+mod macos_runtime {
+    use std::sync::Arc;
+    use std::thread;
+
+    use core_foundation::runloop::CFRunLoop;
+    use core_graphics::event::{
+        CallbackResult, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapPlacement,
+        CGEventTapOptions, CGEventType, EventField, KeyCode,
+    };
+    use objc2::rc::autoreleasepool;
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+
+    use crate::{MenubarController, MenubarRuntimeHandle};
+
+    #[link(name = "AppKit", kind = "framework")]
+    unsafe extern "C" {}
+
+    pub fn start(controller: Arc<MenubarController>) -> ambient_core::Result<MenubarRuntimeHandle> {
+        thread::Builder::new()
+            .name("ambient-menubar-hotkey".to_string())
+            .spawn(move || run_event_tap_loop(controller))
+            .map_err(|e| {
+                ambient_core::CoreError::Internal(format!("failed to spawn menubar runtime: {e}"))
+            })?;
+        Ok(MenubarRuntimeHandle)
+    }
+
+    fn run_event_tap_loop(controller: Arc<MenubarController>) {
+        autoreleasepool(|_| {
+            // Accessory app => no dock icon, no persistent app window.
+            let app: *mut AnyObject = unsafe { msg_send![class!(NSApplication), sharedApplication] };
+            if !app.is_null() {
+                let _: bool = unsafe { msg_send![app, setActivationPolicy: 1isize] };
+            }
+        });
+
+        let install = CGEventTap::with_enabled(
+            CGEventTapLocation::HID,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::Default,
+            vec![CGEventType::KeyDown],
+            move |_proxy, event_type, event| {
+                if (event_type as u32) != (CGEventType::KeyDown as u32) {
+                    return CallbackResult::Keep;
+                }
+                let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE);
+                let flags = event.get_flags();
+                let has_cmd = flags.contains(CGEventFlags::CGEventFlagCommand);
+                let has_shift = flags.contains(CGEventFlags::CGEventFlagShift);
+
+                if keycode == i64::from(KeyCode::SPACE) && has_cmd && has_shift {
+                    controller.on_hotkey();
+                    let _ = controller.update_query("");
+                }
+
+                CallbackResult::Keep
+            },
+            CFRunLoop::run_current,
+        );
+
+        if install.is_err() {
+            return;
+        }
+    }
 }
 
 #[cfg(test)]

@@ -29,7 +29,11 @@ impl RigReasoningEngine {
                 .base_url(ollama_base_url)
                 .build()
                 .ok(),
-            ReasoningBackend::Remote { .. } => None,
+            ReasoningBackend::Remote { provider } => ollama::Client::builder()
+                .api_key(Nothing)
+                .base_url(provider)
+                .build()
+                .ok(),
         };
 
         Self {
@@ -55,7 +59,15 @@ impl RigReasoningEngine {
                         .and_then(|client| client.get(url).send().ok())
                         .is_some_and(|resp| resp.status().is_success())
                 }
-                ReasoningBackend::Remote { .. } => true,
+                ReasoningBackend::Remote { provider } => {
+                    let url = format!("{}/api/tags", provider.trim_end_matches('/'));
+                    reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .ok()
+                        .and_then(|client| client.get(url).send().ok())
+                        .is_some_and(|resp| resp.status().is_success())
+                }
             };
             available.store(ok, Ordering::Relaxed);
             thread::sleep(Duration::from_secs(60));

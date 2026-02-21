@@ -4,7 +4,7 @@
 
 A macOS background daemon written in Rust that:
 1. Watches multiple knowledge sources (Obsidian, Apple Notes, filesystem, and anything Spotlight has already indexed) for changes
-2. Samples cognitive context signals (active app, keystroke density, context switches, audio state) via tsink
+2. Samples cognitive context signals (active app, context switches, audio state) via tsink
 3. Normalizes knowledge content into a canonical `KnowledgeUnit` representation
 4. Stores a persistent property graph + vector knowledge base via LadybugDB (embedded, in-process)
 5. Correlates knowledge units with cognitive context windows from tsink at query time
@@ -57,7 +57,6 @@ pub enum PulseSignal {
     // Sampled every 5 seconds
     ContextSwitchRate   { switches_per_minute: f32 },
     ActiveApp           { bundle_id: String, window_title: Option<String> },
-    KeystrokeDensity    { keystrokes_per_minute: f32 },
 
     // Edge-triggered
     AudioInputActive    { active: bool },
@@ -255,7 +254,6 @@ let pulse_store = StorageBuilder::new()
 ```
 context_switch_rate      labels: {}
 active_app               labels: { bundle_id, window_title }
-keystroke_density        labels: {}
 audio_input_active       labels: { active: "true" | "false" }
 time_context             labels: { hour, day_of_week, is_weekend }
 ```
@@ -315,10 +313,9 @@ When a user clicks an Ambient result in Spotlight, the `ambient://` URL scheme o
 |---|---|---|
 | `ContextSwitchSampler` | `NSWorkspace.activeApplication` diff | 5s tick |
 | `ActiveAppSampler` | `NSWorkspace.activeApplication` + `AXUIElement` for window title | 5s tick |
-| `KeystrokeDensitySampler` | `CGEventTap` (passive, no content capture) | 5s rolling window |
 | `AudioInputSampler` | `AVCaptureDevice` input activity | Edge-triggered |
 
-**Privacy rule:** `KeystrokeDensitySampler` counts events only — it must never buffer or log key content. `ActiveAppSampler` captures window titles only for allow-listed apps (configurable). Both rules are enforced at the sampler level, not assumed by callers.
+**Privacy rule:** `ActiveAppSampler` captures window titles only for allow-listed apps (configurable). This rule is enforced at the sampler level, not assumed by callers.
 
 **`TimeContext` rule:** Derived at `KnowledgeUnit` ingestion time from `unit.observed_at`. Not sampled. Written to tsink alongside the unit's timestamp so it can be queried in the same time window.
 
@@ -431,7 +428,7 @@ ambient export --format json           # dump knowledge base
 | Spotlight inbound (NSMetadataQuery) | `objc2` + `objc2-foundation` |
 | Spotlight outbound (CSSearchableIndex) | `objc2` + `objc2-core-spotlight` |
 | macOS app/window sampling | `core-foundation`, `accessibility-sys` |
-| Keystroke + global hotkey | `core-graphics` (CGEventTap) |
+| Global hotkey | `core-graphics` (CGEventTap) |
 | Audio input detection | `coreaudio-rs` |
 | Menu bar UI | `objc2` + `objc2-app-kit` |
 | Async runtime | `tokio` |
@@ -610,7 +607,6 @@ Work strictly in this order. Do not implement a later phase until the current ph
 
 ### Phase 2 — Pulse
 - [ ] Implement `ContextSwitchSampler` and `ActiveAppSampler` in `ambient-watcher`
-- [ ] Implement `KeystrokeDensitySampler` (event count only, no content)
 - [ ] Implement `AudioInputSampler`
 - [ ] Integrate `tsink` into `ambient-store`, implement `record_pulse` and `pulse_window`
 - [ ] Implement `unit_with_context` correlated query
@@ -663,7 +659,6 @@ Work strictly in this order. Do not implement a later phase until the current ph
 - Every trait has a corresponding `Mock*` impl in `#[cfg(test)]` for unit testing
 - `RawEvent`, `KnowledgeUnit`, `PulseEvent`, `QueryRequest`, and `QueryResult` are the ONLY types crossing crate boundaries in the data pipeline
 - Source adapters must never hold locks longer than a single read operation
-- `KeystrokeDensitySampler` must never buffer key content — count events only
 - `ActiveAppSampler` must filter window titles through a configurable allowlist before writing to tsink
 - LadybugDB access is encapsulated entirely within `ambient-store` — no other crate imports `ladybug`
 - tsink access is encapsulated entirely within `ambient-store` — no other crate imports `tsink`

@@ -12,6 +12,11 @@ ambient-core = { path = "../ambient-core" }
 ambient-onboard = { path = "../ambient-onboard" }
 ambient-patterns = { path = "../ambient-patterns" }
 ambient-query = { path = "../ambient-query" }
+ambient-stream = { path = "../ambient-stream" }
+ambient-transport-bonjour = { path = "../ambient-transport-bonjour" }
+ambient-transport-cloudkit = { path = "../ambient-transport-cloudkit" }
+ambient-transport-google-health = { path = "../ambient-transport-google-health" }
+ambient-transport-local = { path = "../ambient-transport-local" }
 ambient-watcher = { path = "../ambient-watcher" }
 ambient-menubar = { path = "../ambient-menubar" }
 ambient-normalizer = { path = "../ambient-normalizer" }

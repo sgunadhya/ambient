@@ -54,14 +54,18 @@ impl AmbientQueryEngine {
             let (pulse_context, cognitive_state) = if req.include_pulse_context {
                 match self
                     .store
-                    .unit_with_context(unit.id, req.context_window_secs.unwrap_or(120))
+                    .unit_with_context_live(unit.id, req.context_window_secs.unwrap_or(120))
                 {
                     Ok(Some((_, pulse, state))) => (Some(pulse), Some(state)),
                     Ok(None) => (None, None),
                     Err(_) => (None, None),
                 }
             } else {
-                (None, None)
+                match self.store.unit_with_context_fast(unit.id) {
+                    Ok(Some((_, state))) => (None, Some(state)),
+                    Ok(None) => (None, None),
+                    Err(_) => (None, None),
+                }
             };
 
             let semantic_score = if req.k == 0 {
@@ -121,14 +125,18 @@ impl QueryEngine for AmbientQueryEngine {
             let (pulse_context, cognitive_state) = if req.include_pulse_context {
                 match self
                     .store
-                    .unit_with_context(unit.id, req.context_window_secs.unwrap_or(120))
+                    .unit_with_context_live(unit.id, req.context_window_secs.unwrap_or(120))
                 {
                     Ok(Some((_, pulse, state))) => (Some(pulse), Some(state)),
                     Ok(None) => (None, None),
                     Err(_) => (None, None),
                 }
             } else {
-                (None, None)
+                match self.store.unit_with_context_fast(unit.id) {
+                    Ok(Some((_, state))) => (None, Some(state)),
+                    Ok(None) => (None, None),
+                    Err(_) => (None, None),
+                }
             };
 
             let semantic_score = if req.k == 0 {

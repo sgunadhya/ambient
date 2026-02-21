@@ -1,7 +1,11 @@
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use ambient_core::{CoreError, KnowledgeUnit, Normalizer, RawEvent, RawPayload, Result, SourceId};
+use ambient_core::{
+    ConsumerId, EventLogEntry, KnowledgeStore, KnowledgeUnit, Normalizer, Offset, RawEvent,
+    RawPayload, Result, SourceId, StreamProvider, CoreError,
+};
 use chrono::Utc;
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -25,6 +29,70 @@ impl NormalizerDispatch {
     }
 }
 
+pub struct NormalizerConsumer {
+    provider: Arc<dyn StreamProvider>,
+    store: Arc<dyn KnowledgeStore>,
+    dispatch: Arc<NormalizerDispatch>,
+    consumer_id: ConsumerId,
+    offset: Mutex<Offset>,
+}
+
+impl NormalizerConsumer {
+    pub fn new(
+        provider: Arc<dyn StreamProvider>,
+        store: Arc<dyn KnowledgeStore>,
+        dispatch: Arc<NormalizerDispatch>,
+        consumer_id: ConsumerId,
+    ) -> Result<Self> {
+        let offset = provider.last_committed(&consumer_id)?.unwrap_or(0);
+        Ok(Self {
+            provider,
+            store,
+            dispatch,
+            consumer_id,
+            offset: Mutex::new(offset),
+        })
+    }
+
+    pub fn poll_once(&self, limit: usize) -> Result<Vec<KnowledgeUnit>> {
+        let mut offset = self
+            .offset
+            .lock()
+            .map_err(|_| CoreError::Internal("normalizer consumer offset lock poisoned".to_string()))?;
+        let batch = self.provider.read(&self.consumer_id, *offset, limit)?;
+        let mut out = Vec::new();
+
+        for (next_offset, entry) in batch {
+            match entry {
+                EventLogEntry::Raw(raw) => {
+                    match raw.payload.clone() {
+                        RawPayload::FeedbackEventSync { event, .. } => {
+                            let _ = self.store.record_feedback(*event);
+                        }
+                        RawPayload::KnowledgeUnitSync { unit, .. } => {
+                            if self.store.upsert((*unit).clone()).is_ok() {
+                                out.push(*unit);
+                            }
+                        }
+                        _ => {
+                            if let Ok(unit) = self.dispatch.normalize(raw) {
+                                if self.store.upsert(unit.clone()).is_ok() {
+                                    out.push(unit);
+                                }
+                            }
+                        }
+                    }
+                }
+                EventLogEntry::Pulse(_) => {}
+            }
+            self.provider.commit(&self.consumer_id, next_offset)?;
+            *offset = next_offset;
+        }
+
+        Ok(out)
+    }
+}
+
 #[derive(Default)]
 pub struct MarkdownNormalizer;
 
@@ -38,6 +106,9 @@ impl Normalizer for MarkdownNormalizer {
             RawPayload::HealthKitSample { .. } => false,
             RawPayload::CalendarEvent { .. } => false,
             RawPayload::SelfReport { .. } => false,
+            RawPayload::BehavioralSummary { .. } => false,
+            RawPayload::KnowledgeUnitSync { .. } => false,
+            RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -55,7 +126,10 @@ impl Normalizer for MarkdownNormalizer {
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
-            | RawPayload::SelfReport { .. } => {
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                 return Err(CoreError::InvalidInput("expected markdown payload".to_string()))
             }
         };
@@ -99,6 +173,9 @@ impl Normalizer for AppleNotesNormalizer {
             RawPayload::HealthKitSample { .. } => false,
             RawPayload::CalendarEvent { .. } => false,
             RawPayload::SelfReport { .. } => false,
+            RawPayload::BehavioralSummary { .. } => false,
+            RawPayload::KnowledgeUnitSync { .. } => false,
+            RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -120,7 +197,10 @@ impl Normalizer for AppleNotesNormalizer {
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
-            | RawPayload::SelfReport { .. } => {
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                 return Err(CoreError::InvalidInput("expected apple note payload".to_string()))
             }
         };
@@ -155,6 +235,9 @@ impl Normalizer for SpotlightNormalizer {
             RawPayload::HealthKitSample { .. } => false,
             RawPayload::CalendarEvent { .. } => false,
             RawPayload::SelfReport { .. } => false,
+            RawPayload::BehavioralSummary { .. } => false,
+            RawPayload::KnowledgeUnitSync { .. } => false,
+            RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -186,7 +269,10 @@ impl Normalizer for SpotlightNormalizer {
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
-            | RawPayload::SelfReport { .. } => {
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                 return Err(CoreError::InvalidInput("expected spotlight payload".to_string()))
             }
         };
@@ -228,6 +314,9 @@ impl Normalizer for PlainTextNormalizer {
             RawPayload::HealthKitSample { .. } => false,
             RawPayload::CalendarEvent { .. } => false,
             RawPayload::SelfReport { .. } => false,
+            RawPayload::BehavioralSummary { .. } => false,
+            RawPayload::KnowledgeUnitSync { .. } => false,
+            RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -245,7 +334,10 @@ impl Normalizer for PlainTextNormalizer {
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
-            | RawPayload::SelfReport { .. } => {
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                 return Err(CoreError::InvalidInput("expected plaintext payload".to_string()))
             }
         };
@@ -281,7 +373,10 @@ impl Normalizer for HealthKitNormalizer {
             | RawPayload::SpotlightItem { .. }
             | RawPayload::PlainText { .. }
             | RawPayload::CalendarEvent { .. }
-            | RawPayload::SelfReport { .. } => false,
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -298,7 +393,10 @@ impl Normalizer for HealthKitNormalizer {
             | RawPayload::SpotlightItem { .. }
             | RawPayload::PlainText { .. }
             | RawPayload::CalendarEvent { .. }
-            | RawPayload::SelfReport { .. } => {
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                 return Err(CoreError::InvalidInput(
                     "expected healthkit sample payload".to_string(),
                 ))
@@ -339,7 +437,10 @@ impl Normalizer for CalendarNormalizer {
             | RawPayload::SpotlightItem { .. }
             | RawPayload::PlainText { .. }
             | RawPayload::HealthKitSample { .. }
-            | RawPayload::SelfReport { .. } => false,
+            | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -367,7 +468,10 @@ impl Normalizer for CalendarNormalizer {
                 | RawPayload::SpotlightItem { .. }
                 | RawPayload::PlainText { .. }
                 | RawPayload::HealthKitSample { .. }
-                | RawPayload::SelfReport { .. } => {
+                | RawPayload::SelfReport { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                     return Err(CoreError::InvalidInput(
                         "expected calendar event payload".to_string(),
                     ))
@@ -412,7 +516,10 @@ impl Normalizer for SelfReportNormalizer {
             | RawPayload::SpotlightItem { .. }
             | RawPayload::PlainText { .. }
             | RawPayload::HealthKitSample { .. }
-            | RawPayload::CalendarEvent { .. } => false,
+            | RawPayload::CalendarEvent { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => false,
         }
     }
 
@@ -429,7 +536,10 @@ impl Normalizer for SelfReportNormalizer {
             | RawPayload::SpotlightItem { .. }
             | RawPayload::PlainText { .. }
             | RawPayload::HealthKitSample { .. }
-            | RawPayload::CalendarEvent { .. } => {
+            | RawPayload::CalendarEvent { .. }
+            | RawPayload::BehavioralSummary { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
                 return Err(CoreError::InvalidInput(
                     "expected self-report payload".to_string(),
                 ))
@@ -460,6 +570,116 @@ impl Normalizer for SelfReportNormalizer {
             metadata,
             embedding: None,
             observed_at: reported_at,
+        })
+    }
+}
+
+#[derive(Default)]
+pub struct BehavioralSummaryNormalizer;
+
+impl Normalizer for BehavioralSummaryNormalizer {
+    fn can_handle(&self, payload: &RawPayload) -> bool {
+        match payload {
+            RawPayload::BehavioralSummary { .. } => true,
+            RawPayload::Markdown { .. }
+            | RawPayload::AppleNote { .. }
+            | RawPayload::SpotlightItem { .. }
+            | RawPayload::PlainText { .. }
+            | RawPayload::HealthKitSample { .. }
+            | RawPayload::CalendarEvent { .. }
+            | RawPayload::SelfReport { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => false,
+        }
+    }
+
+    fn normalize(&self, event: RawEvent) -> Result<KnowledgeUnit> {
+        let (
+            period_start,
+            period_end,
+            avg_context_switch_rate,
+            peak_context_switch_rate,
+            audio_active_seconds,
+            dominant_app,
+            app_switch_count,
+            was_in_meeting,
+            was_in_focus_block,
+            device_origin,
+        ) = match event.payload {
+            RawPayload::BehavioralSummary {
+                period_start,
+                period_end,
+                avg_context_switch_rate,
+                peak_context_switch_rate,
+                audio_active_seconds,
+                dominant_app,
+                app_switch_count,
+                was_in_meeting,
+                was_in_focus_block,
+                device_origin,
+            } => (
+                period_start,
+                period_end,
+                avg_context_switch_rate,
+                peak_context_switch_rate,
+                audio_active_seconds,
+                dominant_app,
+                app_switch_count,
+                was_in_meeting,
+                was_in_focus_block,
+                device_origin,
+            ),
+            RawPayload::Markdown { .. }
+            | RawPayload::AppleNote { .. }
+            | RawPayload::SpotlightItem { .. }
+            | RawPayload::PlainText { .. }
+            | RawPayload::HealthKitSample { .. }
+            | RawPayload::CalendarEvent { .. }
+            | RawPayload::SelfReport { .. }
+            | RawPayload::KnowledgeUnitSync { .. }
+            | RawPayload::FeedbackEventSync { .. } => {
+                return Err(CoreError::InvalidInput(
+                    "expected behavioral-summary payload".to_string(),
+                ))
+            }
+        };
+
+        let mut metadata = HashMap::new();
+        metadata.insert("period_start".to_string(), Value::String(period_start.to_rfc3339()));
+        metadata.insert("period_end".to_string(), Value::String(period_end.to_rfc3339()));
+        metadata.insert("audio_active_seconds".to_string(), Value::from(audio_active_seconds as u64));
+        metadata.insert("app_switch_count".to_string(), Value::from(app_switch_count as u64));
+        metadata.insert("was_in_meeting".to_string(), Value::Bool(was_in_meeting));
+        metadata.insert(
+            "was_in_focus_block".to_string(),
+            Value::Bool(was_in_focus_block),
+        );
+        metadata.insert("device_origin".to_string(), Value::String(device_origin));
+        metadata.insert(
+            "dominant_app".to_string(),
+            dominant_app.clone().map(Value::String).unwrap_or(Value::Null),
+        );
+
+        let content = format!(
+            "Behavior window {}..{} avg_switch={} peak_switch={} audio_seconds={} app_switches={} dominant_app={}",
+            period_start.to_rfc3339(),
+            period_end.to_rfc3339(),
+            avg_context_switch_rate,
+            peak_context_switch_rate,
+            audio_active_seconds,
+            app_switch_count,
+            dominant_app.unwrap_or_else(|| "unknown".to_string())
+        );
+
+        Ok(KnowledgeUnit {
+            id: Uuid::new_v4(),
+            source: event.source,
+            content_hash: hash_content(&content),
+            content,
+            title: Some("Behavioral Summary".to_string()),
+            metadata,
+            embedding: None,
+            observed_at: period_end,
         })
     }
 }
@@ -553,6 +773,7 @@ pub fn default_dispatch() -> NormalizerDispatch {
         Box::<HealthKitNormalizer>::default(),
         Box::<CalendarNormalizer>::default(),
         Box::<SelfReportNormalizer>::default(),
+        Box::<BehavioralSummaryNormalizer>::default(),
     ])
 }
 

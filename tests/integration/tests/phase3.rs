@@ -77,6 +77,7 @@ fn phase3_query_engine_ranking_and_fallback() {
         auth_token: None,
         status_probe: None,
         deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
+        transport_registry: None,
     });
     let request = Request::builder()
         .method("POST")
