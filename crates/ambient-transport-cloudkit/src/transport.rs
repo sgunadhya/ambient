@@ -17,6 +17,14 @@ pub trait CloudKitChangeFetcher: Send + Sync {
         push_payload: &[u8],
         previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload>;
+
+    fn mode_label(&self) -> &'static str {
+        "json"
+    }
+
+    fn is_available(&self) -> bool {
+        true
+    }
 }
 
 #[derive(Default)]
@@ -29,6 +37,10 @@ impl CloudKitChangeFetcher for JsonPayloadFetcher {
         _previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
         payload_from_bytes(push_payload)
+    }
+
+    fn mode_label(&self) -> &'static str {
+        "json"
     }
 }
 
@@ -201,6 +213,13 @@ impl StreamTransport for CloudKitTransport {
         let state = if self.container.trim().is_empty() || self.zone_name.trim().is_empty() {
             TransportState::Degraded {
                 reason: "cloudkit container/zone not configured".to_string(),
+            }
+        } else if active && !self.fetcher.is_available() {
+            TransportState::Degraded {
+                reason: format!(
+                    "cloudkit {} bridge unavailable in this build",
+                    self.fetcher.mode_label()
+                ),
             }
         } else {
             state
@@ -473,6 +492,52 @@ mod tests {
                 assert!(reason.contains("invalid"));
             }
             other => panic!("expected degraded transport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unavailable_fetcher_marks_transport_degraded() {
+        struct UnavailableFetcher;
+
+        impl CloudKitChangeFetcher for UnavailableFetcher {
+            fn fetch_changes(
+                &self,
+                _push_payload: &[u8],
+                _previous_token: Option<&str>,
+            ) -> Result<CloudKitPushPayload> {
+                Ok(CloudKitPushPayload {
+                    new_change_token: None,
+                    records: Vec::new(),
+                })
+            }
+
+            fn mode_label(&self) -> &'static str {
+                "native"
+            }
+
+            fn is_available(&self) -> bool {
+                false
+            }
+        }
+
+        let transport = CloudKitTransport::with_config(
+            "iCloud.dev.ambient.private".to_string(),
+            "AmbientZone".to_string(),
+            Arc::new(UnavailableFetcher),
+        );
+        let provider: Arc<dyn StreamProvider> = Arc::new(TestProvider::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let _guard = runtime.enter();
+        let _ = transport.start(provider).expect("start");
+
+        match transport.status().state {
+            TransportState::Degraded { reason } => {
+                assert!(reason.contains("unavailable"));
+            }
+            other => panic!("expected degraded status, got {other:?}"),
         }
     }
 }

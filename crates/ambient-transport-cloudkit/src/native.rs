@@ -24,8 +24,14 @@ impl CloudKitChangeFetcher for NativeCloudKitFetcher {
         _previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
         let _ = (&self.container, &self.zone_name);
-        Err(CoreError::Unsupported(
-            "native cloudkit fetch bridge not enabled",
-        ))
+        Err(CoreError::Unsupported("native cloudkit bridge unavailable"))
+    }
+
+    fn mode_label(&self) -> &'static str {
+        "native"
+    }
+
+    fn is_available(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 }
