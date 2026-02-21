@@ -12,6 +12,7 @@ pub struct NativeFetchRequest {
     pub previous_token: Option<String>,
     pub push_is_structured: bool,
     pub raw_payload: Vec<u8>,
+    pub bridge_command: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -27,6 +28,7 @@ pub fn build_fetch_request(
     container: &str,
     zone_name: &str,
     previous_token: Option<&str>,
+    bridge_command: Option<&str>,
 ) -> Result<NativeFetchRequest> {
     let push_is_structured = serde_json::from_slice::<serde_json::Value>(push_payload).is_ok();
     Ok(NativeFetchRequest {
@@ -35,6 +37,7 @@ pub fn build_fetch_request(
         previous_token: previous_token.map(|v| v.to_string()),
         push_is_structured,
         raw_payload: push_payload.to_vec(),
+        bridge_command: bridge_command.map(|v| v.to_string()),
     })
 }
 
@@ -69,10 +72,18 @@ pub fn fetch_changes_native(request: NativeFetchRequest) -> Result<CloudKitPushP
 }
 
 fn run_external_bridge(request: &NativeFetchRequest) -> Result<Option<CloudKitPushPayload>> {
-    let cmd = std::env::var(NATIVE_BRIDGE_CMD_ENV)
-        .ok()
+    let cmd = request
+        .bridge_command
+        .as_ref()
         .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty());
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            std::env::var(NATIVE_BRIDGE_CMD_ENV)
+                .ok()
+                .map(|v| v.trim().to_string())
+                .filter(|v| !v.is_empty())
+        });
+    let cmd = cmd;
     let Some(cmd) = cmd else {
         return Ok(None);
     };
@@ -134,8 +145,14 @@ mod tests {
     #[test]
     fn build_request_keeps_raw_payload() {
         let payload = br#"{"records":[]}"#;
-        let req = build_fetch_request(payload, "iCloud.dev.ambient.private", "AmbientZone", None)
-            .expect("request");
+        let req = build_fetch_request(
+            payload,
+            "iCloud.dev.ambient.private",
+            "AmbientZone",
+            None,
+            None,
+        )
+        .expect("request");
         assert_eq!(req.raw_payload, payload);
     }
 
@@ -146,6 +163,7 @@ mod tests {
             "iCloud.dev.ambient.private",
             "AmbientZone",
             Some("prev"),
+            None,
         )
         .expect("request");
         let mapped = fetch_changes_native(req).expect("mapping");
@@ -160,6 +178,7 @@ mod tests {
             b"\x00\x01\x02",
             "iCloud.dev.ambient.private",
             "AmbientZone",
+            None,
             None,
         )
         .expect("request");

@@ -97,11 +97,19 @@ impl CloudKitTransport {
         }
     }
 
-    pub fn with_native_bridge(container: String, zone_name: String) -> Self {
+    pub fn with_native_bridge(
+        container: String,
+        zone_name: String,
+        bridge_command: Option<String>,
+    ) -> Self {
         Self::with_config(
             container.clone(),
             zone_name.clone(),
-            Arc::new(NativeCloudKitFetcher::new(container, zone_name)),
+            Arc::new(NativeCloudKitFetcher::with_bridge_command(
+                container,
+                zone_name,
+                bridge_command,
+            )),
         )
     }
 

@@ -66,6 +66,7 @@ impl TransportRegistry {
                 transports.push(Arc::new(CloudKitTransport::with_native_bridge(
                     config.cloudkit_container.clone(),
                     config.cloudkit_zone_name.clone(),
+                    config.cloudkit_native_bridge_cmd.clone(),
                 )));
             } else {
                 transports.push(Arc::new(CloudKitTransport::with_config(
@@ -247,6 +248,7 @@ pub struct AmbientConfig {
     pub cloudkit_container: String,
     pub cloudkit_zone_name: String,
     pub cloudkit_native_bridge: bool,
+    pub cloudkit_native_bridge_cmd: Option<String>,
     pub http_port: u16,
     pub auth_token: Option<String>,
 }
@@ -283,6 +285,7 @@ impl Default for AmbientConfig {
             cloudkit_container: "iCloud.dev.ambient.private".to_string(),
             cloudkit_zone_name: "AmbientZone".to_string(),
             cloudkit_native_bridge: false,
+            cloudkit_native_bridge_cmd: None,
             http_port: 7474,
             auth_token: None,
         }
@@ -423,6 +426,7 @@ struct CloudKitConfig {
     container: String,
     zone_name: String,
     native_bridge: bool,
+    native_bridge_cmd: Option<String>,
 }
 
 impl Default for CloudKitConfig {
@@ -432,6 +436,7 @@ impl Default for CloudKitConfig {
             container: d.cloudkit_container,
             zone_name: d.cloudkit_zone_name,
             native_bridge: d.cloudkit_native_bridge,
+            native_bridge_cmd: d.cloudkit_native_bridge_cmd,
         }
     }
 }
@@ -497,6 +502,10 @@ impl AmbientConfig {
             cloudkit_container: parsed.cloudkit.container,
             cloudkit_zone_name: parsed.cloudkit.zone_name,
             cloudkit_native_bridge: parsed.cloudkit.native_bridge,
+            cloudkit_native_bridge_cmd: parsed
+                .cloudkit
+                .native_bridge_cmd
+                .and_then(|cmd| if cmd.trim().is_empty() { None } else { Some(cmd) }),
             http_port: parsed.daemon.http_port,
             auth_token: parsed
                 .daemon
@@ -717,6 +726,7 @@ feedback_weight = 0.3
 container = "iCloud.dev.ambient.private"
 zone_name = "AmbientZone"
 native_bridge = false
+native_bridge_cmd = ""
 
 [reasoning]
 backend = "local"
@@ -1434,6 +1444,7 @@ feedback_weight = 0.3
 container = "iCloud.test.container"
 zone_name = "TestZone"
 native_bridge = true
+native_bridge_cmd = "/usr/local/bin/ambient-cloudkit-bridge"
 
 [daemon]
 http_port = 7474
@@ -1447,6 +1458,10 @@ auth_token = ""
         assert!(cfg.cloudkit_native_bridge);
         assert_eq!(cfg.cloudkit_container, "iCloud.test.container");
         assert_eq!(cfg.cloudkit_zone_name, "TestZone");
+        assert_eq!(
+            cfg.cloudkit_native_bridge_cmd.as_deref(),
+            Some("/usr/local/bin/ambient-cloudkit-bridge")
+        );
         assert!(!cfg.bonjour);
     }
 

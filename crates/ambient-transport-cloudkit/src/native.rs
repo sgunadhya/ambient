@@ -7,13 +7,23 @@ use crate::transport::CloudKitChangeFetcher;
 pub struct NativeCloudKitFetcher {
     container: String,
     zone_name: String,
+    bridge_command: Option<String>,
 }
 
 impl NativeCloudKitFetcher {
     pub fn new(container: String, zone_name: String) -> Self {
+        Self::with_bridge_command(container, zone_name, None)
+    }
+
+    pub fn with_bridge_command(
+        container: String,
+        zone_name: String,
+        bridge_command: Option<String>,
+    ) -> Self {
         Self {
             container,
             zone_name,
+            bridge_command,
         }
     }
 }
@@ -44,7 +54,13 @@ impl NativeCloudKitFetcher {
         previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
         let request =
-            build_fetch_request(push_payload, &self.container, &self.zone_name, previous_token)?;
+            build_fetch_request(
+                push_payload,
+                &self.container,
+                &self.zone_name,
+                previous_token,
+                self.bridge_command.as_deref(),
+            )?;
         fetch_changes_native(request)
     }
 
@@ -55,7 +71,13 @@ impl NativeCloudKitFetcher {
         previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
         let request =
-            build_fetch_request(push_payload, &self.container, &self.zone_name, previous_token)?;
+            build_fetch_request(
+                push_payload,
+                &self.container,
+                &self.zone_name,
+                previous_token,
+                self.bridge_command.as_deref(),
+            )?;
         fetch_changes_native(request)
     }
 }
@@ -85,9 +107,14 @@ mod tests {
             "iCloud.dev.ambient.private",
             "AmbientZone",
             Some("tok-1"),
+            Some("/usr/local/bin/cloudkit-bridge"),
         )
         .expect("request");
         assert!(req.push_is_structured);
         assert_eq!(req.previous_token.as_deref(), Some("tok-1"));
+        assert_eq!(
+            req.bridge_command.as_deref(),
+            Some("/usr/local/bin/cloudkit-bridge")
+        );
     }
 }
