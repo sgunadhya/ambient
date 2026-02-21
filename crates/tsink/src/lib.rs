@@ -43,6 +43,12 @@ pub struct StorageBuilder {
     wal_sync_mode: Option<WalSyncMode>,
 }
 
+impl Default for StorageBuilder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StorageBuilder {
     pub fn new() -> Self {
         Self {
@@ -74,12 +80,7 @@ impl StorageBuilder {
     }
 
     pub fn build(self) -> Result<Storage> {
-        if self
-            .data_path
-            .as_deref()
-            .map(str::is_empty)
-            .unwrap_or(true)
-        {
+        if self.data_path.as_deref().map(str::is_empty).unwrap_or(true) {
             return Err(TsinkError::InvalidPath);
         }
 

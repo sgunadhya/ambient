@@ -4,7 +4,7 @@ use std::sync::Arc;
 use ambient_cli::{build_router, run_query, HttpAppState};
 use ambient_core::{KnowledgeStore, KnowledgeUnit, QueryEngine, QueryRequest, SourceId};
 use ambient_query::AmbientQueryEngine;
-use ambient_store::LadybugStore;
+use ambient_store::CozoStore;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::Utc;
@@ -12,7 +12,7 @@ use tower::ServiceExt;
 
 #[test]
 fn phase3_query_engine_ranking_and_fallback() {
-    let store = Arc::new(LadybugStore::new().expect("store"));
+    let store = Arc::new(CozoStore::new().expect("store"));
 
     for i in 0..10 {
         store
@@ -46,7 +46,7 @@ fn phase3_query_engine_ranking_and_fallback() {
     assert_eq!(cli.len(), direct.len());
 
     // FTS fallback path: no embeddings.
-    let store_no_embeddings = Arc::new(LadybugStore::new().expect("store"));
+    let store_no_embeddings = Arc::new(CozoStore::new().expect("store"));
     store_no_embeddings
         .upsert(KnowledgeUnit {
             id: uuid::Uuid::new_v4(),

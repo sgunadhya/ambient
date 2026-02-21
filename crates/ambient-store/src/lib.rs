@@ -22,7 +22,7 @@ const METRIC_MOOD_LEVEL: &str = "mood_level";
 const METRIC_HRV_SCORE: &str = "hrv_score";
 const METRIC_SLEEP_QUALITY: &str = "sleep_quality";
 
-pub struct LadybugStore {
+pub struct CozoStore {
     cozo: DbInstance,
     units: Mutex<HashMap<Uuid, KnowledgeUnit>>,
     hash_index: Mutex<HashMap<[u8; 32], Uuid>>,
@@ -32,7 +32,7 @@ pub struct LadybugStore {
     pulse_storage: tsink::Storage,
 }
 
-impl LadybugStore {
+impl CozoStore {
     pub fn new() -> Result<Self> {
         let cozo_path = resolve_cozo_path()?;
 
@@ -550,8 +550,9 @@ impl LadybugStore {
     }
 }
 
-impl KnowledgeStore for LadybugStore {
+impl KnowledgeStore for CozoStore {
     fn upsert(&self, unit: KnowledgeUnit) -> Result<()> {
+        // ── Deduplication ────────────────────────────────────────────────────
         {
             let mut hashes = self
                 .hash_index
@@ -565,26 +566,26 @@ impl KnowledgeStore for LadybugStore {
             hashes.insert(unit.content_hash, unit.id);
         }
 
-        self.units
-            .lock()
-            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-            .insert(unit.id, unit.clone());
-
-        self.cozo_put_note(&unit);
-        self.index_links(&unit)?;
-
-        // TimeContext is derived at ingestion time from observed_at.
+        // ── Derive cognitive state BEFORE any writes ──────────────────────────
+        // Record TimeContext first so it is included in the pulse window query.
+        // TimeContext is always derived from observed_at — never sampled.
         self.record_pulse(Self::derive_time_context(unit.observed_at))?;
+
         let window_secs = 120i64;
         let from = unit.observed_at - chrono::Duration::seconds(window_secs);
         let to = unit.observed_at + chrono::Duration::seconds(window_secs);
-        if let Ok(pulse) = self.pulse_window(from, to) {
-            let state = derive_cognitive_state(unit.observed_at, &pulse);
+
+        // Best-effort pulse window: fall back to empty vec if tsink is unavailable.
+        // The snapshot is always written — even with an empty window the cognitive
+        // state defaults are stored so unit_with_context_fast never has a miss.
+        let pulse = self.pulse_window(from, to).unwrap_or_default();
+        let state = derive_cognitive_state(unit.observed_at, &pulse);
+        let avg_switch = {
             let (sum, count) = pulse.iter().fold((0.0f64, 0usize), |acc, event| {
                 match event.signal {
-                    PulseSignal::ContextSwitchRate {
-                        switches_per_minute,
-                    } => (acc.0 + switches_per_minute as f64, acc.1 + 1),
+                    PulseSignal::ContextSwitchRate { switches_per_minute } => {
+                        (acc.0 + switches_per_minute as f64, acc.1 + 1)
+                    }
                     PulseSignal::ActiveApp { .. }
                     | PulseSignal::AudioInputActive { .. }
                     | PulseSignal::TimeContext { .. }
@@ -595,13 +596,30 @@ impl KnowledgeStore for LadybugStore {
                     | PulseSignal::SleepQuality { .. } => acc,
                 }
             });
-            let avg_switch = if count == 0 { 0.0 } else { sum / count as f64 };
-            self.cozo_put_snapshot(&unit, window_secs, &state, avg_switch);
-            let _ = self
-                .snapshots
-                .lock()
-                .map(|mut snapshots| snapshots.insert(unit.id, state));
-        }
+            if count == 0 { 0.0 } else { sum / count as f64 }
+        };
+
+        // ── Update in-memory caches ───────────────────────────────────────────
+        self.units
+            .lock()
+            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
+            .insert(unit.id, unit.clone());
+        let _ = self
+            .snapshots
+            .lock()
+            .map(|mut s| s.insert(unit.id, state.clone()));
+
+        // ── Atomic CozoDB writes: note and snapshot together ──────────────────
+        // Both writes run unconditionally and back-to-back. The snapshot is
+        // never conditional on pulse availability — a unit without a snapshot
+        // is an invariant violation that would cause unit_with_context_fast to
+        // fall through to the expensive tsink query on every call.
+        self.cozo_put_note(&unit);
+        self.cozo_put_snapshot(&unit, window_secs, &state, avg_switch);
+
+        // ── Index wikilinks ───────────────────────────────────────────────────
+        self.index_links(&unit)?;
+
         Ok(())
     }
 
@@ -868,7 +886,7 @@ mod tests {
 
     #[test]
     fn pulse_window_returns_sorted_events() {
-        let store = LadybugStore::new().expect("store should build");
+        let store = CozoStore::new().expect("store should build");
         let base = Utc::now();
 
         store
@@ -907,7 +925,7 @@ mod tests {
 
     #[test]
     fn unit_with_context_derives_cognitive_state() {
-        let store = LadybugStore::new().expect("store should build");
+        let store = CozoStore::new().expect("store should build");
         let observed_at = Utc::now();
         let id = Uuid::new_v4();
 

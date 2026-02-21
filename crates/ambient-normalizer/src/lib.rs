@@ -1,10 +1,12 @@
+pub mod applenotes;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use ambient_core::{
-    ConsumerId, EventLogEntry, KnowledgeStore, KnowledgeUnit, Normalizer, Offset, RawEvent,
-    RawPayload, Result, SourceId, StreamProvider, CoreError,
+    ConsumerId, CoreError, EventLogEntry, KnowledgeStore, KnowledgeUnit, Normalizer, Offset,
+    RawEvent, RawPayload, Result, SourceId, StreamProvider,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -55,34 +57,31 @@ impl NormalizerConsumer {
     }
 
     pub fn poll_once(&self, limit: usize) -> Result<Vec<KnowledgeUnit>> {
-        let mut offset = self
-            .offset
-            .lock()
-            .map_err(|_| CoreError::Internal("normalizer consumer offset lock poisoned".to_string()))?;
+        let mut offset = self.offset.lock().map_err(|_| {
+            CoreError::Internal("normalizer consumer offset lock poisoned".to_string())
+        })?;
         let batch = self.provider.read(&self.consumer_id, *offset, limit)?;
         let mut out = Vec::new();
 
         for (next_offset, entry) in batch {
             match entry {
-                EventLogEntry::Raw(raw) => {
-                    match raw.payload.clone() {
-                        RawPayload::FeedbackEventSync { event, .. } => {
-                            let _ = self.store.record_feedback(*event);
+                EventLogEntry::Raw(raw) => match raw.payload.clone() {
+                    RawPayload::FeedbackEventSync { event, .. } => {
+                        let _ = self.store.record_feedback(*event);
+                    }
+                    RawPayload::KnowledgeUnitSync { unit, .. } => {
+                        if self.store.upsert((*unit).clone()).is_ok() {
+                            out.push(*unit);
                         }
-                        RawPayload::KnowledgeUnitSync { unit, .. } => {
-                            if self.store.upsert((*unit).clone()).is_ok() {
-                                out.push(*unit);
-                            }
-                        }
-                        _ => {
-                            if let Ok(unit) = self.dispatch.normalize(raw) {
-                                if self.store.upsert(unit.clone()).is_ok() {
-                                    out.push(unit);
-                                }
+                    }
+                    _ => {
+                        if let Ok(unit) = self.dispatch.normalize(raw) {
+                            if self.store.upsert(unit.clone()).is_ok() {
+                                out.push(unit);
                             }
                         }
                     }
-                }
+                },
                 EventLogEntry::Pulse(_) => {}
             }
             self.provider.commit(&self.consumer_id, next_offset)?;
@@ -116,13 +115,19 @@ impl Normalizer for MarkdownNormalizer {
         let (content, path) = match event.payload {
             RawPayload::Markdown { content, path } => (content, path),
             RawPayload::AppleNote { .. } => {
-                return Err(CoreError::InvalidInput("expected markdown payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected markdown payload".to_string(),
+                ))
             }
             RawPayload::SpotlightItem { .. } => {
-                return Err(CoreError::InvalidInput("expected markdown payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected markdown payload".to_string(),
+                ))
             }
             RawPayload::PlainText { .. } => {
-                return Err(CoreError::InvalidInput("expected markdown payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected markdown payload".to_string(),
+                ))
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
@@ -130,7 +135,9 @@ impl Normalizer for MarkdownNormalizer {
             | RawPayload::BehavioralSummary { .. }
             | RawPayload::KnowledgeUnitSync { .. }
             | RawPayload::FeedbackEventSync { .. } => {
-                return Err(CoreError::InvalidInput("expected markdown payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected markdown payload".to_string(),
+                ))
             }
         };
 
@@ -187,13 +194,19 @@ impl Normalizer for AppleNotesNormalizer {
                 modified_at,
             } => (protobuf_blob, note_id, modified_at),
             RawPayload::Markdown { .. } => {
-                return Err(CoreError::InvalidInput("expected apple note payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected apple note payload".to_string(),
+                ))
             }
             RawPayload::SpotlightItem { .. } => {
-                return Err(CoreError::InvalidInput("expected apple note payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected apple note payload".to_string(),
+                ))
             }
             RawPayload::PlainText { .. } => {
-                return Err(CoreError::InvalidInput("expected apple note payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected apple note payload".to_string(),
+                ))
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
@@ -201,11 +214,37 @@ impl Normalizer for AppleNotesNormalizer {
             | RawPayload::BehavioralSummary { .. }
             | RawPayload::KnowledgeUnitSync { .. }
             | RawPayload::FeedbackEventSync { .. } => {
-                return Err(CoreError::InvalidInput("expected apple note payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected apple note payload".to_string(),
+                ))
             }
         };
 
-        let content = String::from_utf8_lossy(blob.as_ref()).to_string();
+        use crate::applenotes::applenotes::Document;
+        use prost::Message;
+
+        let content = match Document::decode(blob.as_ref()) {
+            Ok(doc) => {
+                let mut text = String::new();
+                for node in doc.nodes {
+                    if !text.is_empty() && !text.ends_with('\n') {
+                        text.push('\n');
+                    }
+                    text.push_str(&node.text);
+                }
+                text.trim().to_string()
+            }
+            Err(_) => {
+                // Fallback to text extraction if schema is incomplete, making sure to strip unprintable chars.
+                let raw = String::from_utf8_lossy(blob.as_ref()).into_owned();
+                raw.chars()
+                    .filter(|c| {
+                        c.is_alphanumeric() || c.is_whitespace() || c.is_ascii_punctuation()
+                    })
+                    .collect::<String>()
+            }
+        };
+
         let mut metadata = HashMap::new();
         metadata.insert("apple_note_id".to_string(), Value::String(note_id));
 
@@ -259,13 +298,19 @@ impl Normalizer for SpotlightNormalizer {
                 file_url,
             ),
             RawPayload::Markdown { .. } => {
-                return Err(CoreError::InvalidInput("expected spotlight payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected spotlight payload".to_string(),
+                ))
             }
             RawPayload::AppleNote { .. } => {
-                return Err(CoreError::InvalidInput("expected spotlight payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected spotlight payload".to_string(),
+                ))
             }
             RawPayload::PlainText { .. } => {
-                return Err(CoreError::InvalidInput("expected spotlight payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected spotlight payload".to_string(),
+                ))
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
@@ -273,7 +318,9 @@ impl Normalizer for SpotlightNormalizer {
             | RawPayload::BehavioralSummary { .. }
             | RawPayload::KnowledgeUnitSync { .. }
             | RawPayload::FeedbackEventSync { .. } => {
-                return Err(CoreError::InvalidInput("expected spotlight payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected spotlight payload".to_string(),
+                ))
             }
         };
 
@@ -324,13 +371,19 @@ impl Normalizer for PlainTextNormalizer {
         let (content, path) = match event.payload {
             RawPayload::PlainText { content, path } => (content, path),
             RawPayload::Markdown { .. } => {
-                return Err(CoreError::InvalidInput("expected plaintext payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected plaintext payload".to_string(),
+                ))
             }
             RawPayload::AppleNote { .. } => {
-                return Err(CoreError::InvalidInput("expected plaintext payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected plaintext payload".to_string(),
+                ))
             }
             RawPayload::SpotlightItem { .. } => {
-                return Err(CoreError::InvalidInput("expected plaintext payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected plaintext payload".to_string(),
+                ))
             }
             RawPayload::HealthKitSample { .. }
             | RawPayload::CalendarEvent { .. }
@@ -338,7 +391,9 @@ impl Normalizer for PlainTextNormalizer {
             | RawPayload::BehavioralSummary { .. }
             | RawPayload::KnowledgeUnitSync { .. }
             | RawPayload::FeedbackEventSync { .. } => {
-                return Err(CoreError::InvalidInput("expected plaintext payload".to_string()))
+                return Err(CoreError::InvalidInput(
+                    "expected plaintext payload".to_string(),
+                ))
             }
         };
 
@@ -404,7 +459,11 @@ impl Normalizer for HealthKitNormalizer {
         };
 
         let metric_name = format!("{metric:?}");
-        let title = Some(format!("{} reading — {}", metric_name, recorded_at.date_naive()));
+        let title = Some(format!(
+            "{} reading — {}",
+            metric_name,
+            recorded_at.date_naive()
+        ));
         let content = format!("{metric_name}: {value}{unit}");
 
         let mut metadata = HashMap::new();
@@ -415,7 +474,10 @@ impl Normalizer for HealthKitNormalizer {
         Ok(KnowledgeUnit {
             id: Uuid::new_v4(),
             source: event.source,
-            content_hash: hash_content(&format!("{metric_name}:{}", recorded_at.timestamp_millis())),
+            content_hash: hash_content(&format!(
+                "{metric_name}:{}",
+                recorded_at.timestamp_millis()
+            )),
             content,
             title,
             metadata,
@@ -469,9 +531,9 @@ impl Normalizer for CalendarNormalizer {
                 | RawPayload::PlainText { .. }
                 | RawPayload::HealthKitSample { .. }
                 | RawPayload::SelfReport { .. }
-            | RawPayload::BehavioralSummary { .. }
-            | RawPayload::KnowledgeUnitSync { .. }
-            | RawPayload::FeedbackEventSync { .. } => {
+                | RawPayload::BehavioralSummary { .. }
+                | RawPayload::KnowledgeUnitSync { .. }
+                | RawPayload::FeedbackEventSync { .. } => {
                     return Err(CoreError::InvalidInput(
                         "expected calendar event payload".to_string(),
                     ))
@@ -488,7 +550,10 @@ impl Normalizer for CalendarNormalizer {
             "duration_minutes".to_string(),
             Value::from(duration_minutes as u64),
         );
-        metadata.insert("attendee_count".to_string(), Value::from(attendee_count as u64));
+        metadata.insert(
+            "attendee_count".to_string(),
+            Value::from(attendee_count as u64),
+        );
         metadata.insert("calendar_name".to_string(), Value::String(calendar_name));
 
         Ok(KnowledgeUnit {
@@ -645,10 +710,22 @@ impl Normalizer for BehavioralSummaryNormalizer {
         };
 
         let mut metadata = HashMap::new();
-        metadata.insert("period_start".to_string(), Value::String(period_start.to_rfc3339()));
-        metadata.insert("period_end".to_string(), Value::String(period_end.to_rfc3339()));
-        metadata.insert("audio_active_seconds".to_string(), Value::from(audio_active_seconds as u64));
-        metadata.insert("app_switch_count".to_string(), Value::from(app_switch_count as u64));
+        metadata.insert(
+            "period_start".to_string(),
+            Value::String(period_start.to_rfc3339()),
+        );
+        metadata.insert(
+            "period_end".to_string(),
+            Value::String(period_end.to_rfc3339()),
+        );
+        metadata.insert(
+            "audio_active_seconds".to_string(),
+            Value::from(audio_active_seconds as u64),
+        );
+        metadata.insert(
+            "app_switch_count".to_string(),
+            Value::from(app_switch_count as u64),
+        );
         metadata.insert("was_in_meeting".to_string(), Value::Bool(was_in_meeting));
         metadata.insert(
             "was_in_focus_block".to_string(),
@@ -657,7 +734,10 @@ impl Normalizer for BehavioralSummaryNormalizer {
         metadata.insert("device_origin".to_string(), Value::String(device_origin));
         metadata.insert(
             "dominant_app".to_string(),
-            dominant_app.clone().map(Value::String).unwrap_or(Value::Null),
+            dominant_app
+                .clone()
+                .map(Value::String)
+                .unwrap_or(Value::Null),
         );
 
         let content = format!(
@@ -692,11 +772,32 @@ fn first_h1(content: &str) -> Option<String> {
 }
 
 fn markdown_to_text(content: &str) -> String {
-    content
-        .replace('#', "")
-        .replace("**", "")
-        .replace('*', "")
-        .replace('`', "")
+    use pulldown_cmark::{Event, Parser};
+    let parser = Parser::new(content);
+    let mut plain_text = String::new();
+    let mut last_was_text = false;
+    for event in parser {
+        match event {
+            Event::Text(text) => {
+                plain_text.push_str(&text);
+                last_was_text = true;
+            }
+            Event::Code(code) => {
+                plain_text.push_str(&code);
+                last_was_text = true;
+            }
+            Event::SoftBreak | Event::HardBreak => {
+                if last_was_text {
+                    plain_text.push(' ');
+                }
+                last_was_text = false;
+            }
+            _ => {
+                last_was_text = false;
+            }
+        }
+    }
+    plain_text.trim().to_string()
 }
 
 fn extract_wikilinks(content: &str) -> Vec<String> {
@@ -735,7 +836,8 @@ fn extract_tags(content: &str) -> Vec<String> {
 }
 
 fn stem(path: &Path) -> Option<String> {
-    path.file_stem().map(|stem| stem.to_string_lossy().to_string())
+    path.file_stem()
+        .map(|stem| stem.to_string_lossy().to_string())
 }
 
 fn title_from_content_type(content_type: &str, fallback: &str) -> String {
@@ -752,16 +854,7 @@ fn title_from_content_type(content_type: &str, fallback: &str) -> String {
 }
 
 fn hash_content(content: &str) -> [u8; 32] {
-    use std::hash::{Hash, Hasher};
-
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    content.hash(&mut hasher);
-    let value = hasher.finish();
-    let mut out = [0u8; 32];
-    for idx in 0..4 {
-        out[idx * 8..(idx + 1) * 8].copy_from_slice(&value.to_le_bytes());
-    }
-    out
+    blake3::hash(content.as_bytes()).into()
 }
 
 pub fn default_dispatch() -> NormalizerDispatch {

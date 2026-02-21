@@ -5,7 +5,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use ambient_core::{CognitiveState, KnowledgeStore, KnowledgeUnit, QueryRequest, QueryResult, SourceId, Result};
+use ambient_core::{
+    CognitiveState, KnowledgeStore, KnowledgeUnit, QueryRequest, QueryResult, Result, SourceId,
+};
 use chrono::{Datelike, Timelike, Utc};
 use uuid::Uuid;
 
@@ -85,7 +87,7 @@ impl PatternDetector {
                 item.cognitive_state
                     .as_ref()
                     .and_then(|s| s.time_of_day)
-                    .is_some_and(|hour| hour >= 22 || hour < 6)
+                    .is_some_and(|hour| !(6..22).contains(&hour))
             })
             .count();
         if late_night_count > 0 {
@@ -99,12 +101,7 @@ impl PatternDetector {
         // Topic co-occurrence approximation using tags in metadata.
         let mut tag_counts: HashMap<String, usize> = HashMap::new();
         for item in candidates {
-            if let Some(tags) = item
-                .unit
-                .metadata
-                .get("tags")
-                .and_then(|v| v.as_array())
-            {
+            if let Some(tags) = item.unit.metadata.get("tags").and_then(|v| v.as_array()) {
                 for tag in tags.iter().filter_map(|v| v.as_str()) {
                     *tag_counts.entry(tag.to_string()).or_insert(0) += 1;
                 }
@@ -122,7 +119,10 @@ impl PatternDetector {
         if !revisit.is_empty() {
             out.push(PatternInsight {
                 key: "revisit-candidates".to_string(),
-                summary: format!("{} highly stale notes are candidates for revisit", revisit.len()),
+                summary: format!(
+                    "{} highly stale notes are candidates for revisit",
+                    revisit.len()
+                ),
                 score: revisit.len() as f32,
             });
         }
@@ -130,7 +130,12 @@ impl PatternDetector {
         Ok(out)
     }
 
-    pub fn should_run_now(&self, idle_minutes: u64, plugged_in: bool, battery_percent: f32) -> bool {
+    pub fn should_run_now(
+        &self,
+        idle_minutes: u64,
+        plugged_in: bool,
+        battery_percent: f32,
+    ) -> bool {
         let hour = Utc::now().hour();
         idle_minutes > 10 && (plugged_in || battery_percent > 80.0) && (1..6).contains(&hour)
     }
@@ -159,7 +164,8 @@ impl PatternDetector {
         let mut out = Vec::new();
 
         for unit in units.into_iter().take(limit) {
-            let (pulse_context, cognitive_state) = match self.store.unit_with_context(unit.id, 120) {
+            let (pulse_context, cognitive_state) = match self.store.unit_with_context(unit.id, 120)
+            {
                 Ok(Some((_, pulse, state))) => (Some(pulse), Some(state)),
                 _ => (None, Some(default_state(&unit))),
             };
@@ -254,7 +260,10 @@ impl PatternScheduler {
     }
 }
 
-fn persist_pattern_results(store: &Arc<dyn KnowledgeStore>, insights: &[PatternInsight]) -> Result<()> {
+fn persist_pattern_results(
+    store: &Arc<dyn KnowledgeStore>,
+    insights: &[PatternInsight],
+) -> Result<()> {
     for insight in insights {
         let content = format!("Pattern: {}\n{}", insight.key, insight.summary);
         let hash = blake3::hash(content.as_bytes());
@@ -277,14 +286,22 @@ fn persist_pattern_results(store: &Arc<dyn KnowledgeStore>, insights: &[PatternI
 }
 
 fn write_weekly_report(report_dir: &Path, insights: &[PatternInsight]) -> Result<PathBuf> {
-    fs::create_dir_all(report_dir)
-        .map_err(|e| ambient_core::CoreError::Internal(format!("failed creating report dir: {e}")))?;
+    fs::create_dir_all(report_dir).map_err(|e| {
+        ambient_core::CoreError::Internal(format!("failed creating report dir: {e}"))
+    })?;
 
     let now = Utc::now();
-    let filename = format!("weekly-{:04}{:02}{:02}.html", now.year(), now.month(), now.day());
+    let filename = format!(
+        "weekly-{:04}{:02}{:02}.html",
+        now.year(),
+        now.month(),
+        now.day()
+    );
     let path = report_dir.join(filename);
 
-    let mut html = String::from("<html><head><meta charset=\"utf-8\"><title>Ambient Weekly Insights</title></head><body>");
+    let mut html = String::from(
+        "<html><head><meta charset=\"utf-8\"><title>Ambient Weekly Insights</title></head><body>",
+    );
     html.push_str("<h1>Ambient Weekly Insights</h1><ul>");
     for insight in insights {
         html.push_str(&format!(
@@ -302,7 +319,12 @@ fn write_weekly_report(report_dir: &Path, insights: &[PatternInsight]) -> Result
 
 fn notify_report_ready(report_dir: &Path) {
     let now = Utc::now();
-    let filename = format!("weekly-{:04}{:02}{:02}.html", now.year(), now.month(), now.day());
+    let filename = format!(
+        "weekly-{:04}{:02}{:02}.html",
+        now.year(),
+        now.month(),
+        now.day()
+    );
     let path = report_dir.join(filename);
 
     #[cfg(target_os = "macos")]
@@ -311,7 +333,10 @@ fn notify_report_ready(report_dir: &Path) {
             "display notification \"{}\" with title \"Ambient\"",
             path.display()
         );
-        let _ = std::process::Command::new("osascript").arg("-e").arg(script).output();
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .output();
     }
 
     #[cfg(not(target_os = "macos"))]

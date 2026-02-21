@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -292,12 +292,6 @@ pub enum LicenseError {
     Expired { expires_at: DateTime<Utc> },
 }
 
-#[derive(Debug, Clone, Default)]
-pub struct WatchHandle;
-
-#[derive(Debug, Clone, Default)]
-pub struct SamplerHandle;
-
 pub type Offset = u64;
 pub type ConsumerId = String;
 pub type TransportId = String;
@@ -334,15 +328,6 @@ pub struct PeerStatus {
     pub last_seen: DateTime<Utc>,
     pub events_received: u64,
     pub reachable: bool,
-}
-
-pub trait SourceAdapter: Send + Sync {
-    fn source_id(&self) -> SourceId;
-    fn watch(&self, tx: Sender<RawEvent>) -> Result<WatchHandle>;
-}
-
-pub trait PulseSampler: Send + Sync {
-    fn start(&self, tx: Sender<PulseEvent>) -> Result<SamplerHandle>;
 }
 
 pub trait Normalizer: Send + Sync {
@@ -596,71 +581,10 @@ pub mod mocks {
         CapabilityGate, CapabilityStatus, CognitiveState, ConsumerId, CoreError, EventLogEntry,
         ExternalDependency, FeedbackEvent, GatedCapability, GatedFeature, KnowledgeStore,
         LicenseError, LicenseGate, LoadAware, Normalizer, Offset, PeerStatus, PulseEvent,
-        PulseSampler, QueryEngine, QueryRequest, QueryResult, RawEvent, RawPayload, ReasoningEngine,
-        Result, SamplerHandle, SourceAdapter, SourceId, SpotlightExporter, StreamProvider,
-        StreamTransport, SystemLoad, TransportState, TransportStatus, TriggerAction, TriggerCondition,
-        WatchHandle,
+        QueryEngine, QueryRequest, QueryResult, RawEvent, RawPayload, ReasoningEngine, Result,
+        SpotlightExporter, StreamProvider, StreamTransport, SystemLoad, TransportState,
+        TransportStatus, TriggerAction, TriggerCondition,
     };
-
-    #[derive(Debug, Clone)]
-    pub struct SourceAdapterCall {
-        pub method: String,
-    }
-
-    pub struct MockSourceAdapter {
-        pub source: SourceId,
-        pub calls: Mutex<Vec<SourceAdapterCall>>,
-    }
-
-    impl Default for MockSourceAdapter {
-        fn default() -> Self {
-            Self {
-                source: SourceId::new("mock"),
-                calls: Mutex::new(Vec::new()),
-            }
-        }
-    }
-
-    impl SourceAdapter for MockSourceAdapter {
-        fn source_id(&self) -> SourceId {
-            if let Ok(mut calls) = self.calls.lock() {
-                calls.push(SourceAdapterCall {
-                    method: "source_id".to_string(),
-                });
-            }
-            self.source.clone()
-        }
-
-        fn watch(&self, _tx: std::sync::mpsc::Sender<RawEvent>) -> Result<WatchHandle> {
-            if let Ok(mut calls) = self.calls.lock() {
-                calls.push(SourceAdapterCall {
-                    method: "watch".to_string(),
-                });
-            }
-            Ok(WatchHandle)
-        }
-    }
-
-    #[derive(Debug, Clone)]
-    pub struct PulseSamplerCall {
-        pub method: String,
-    }
-
-    #[derive(Default)]
-    pub struct MockPulseSampler {
-        pub calls: Mutex<Vec<PulseSamplerCall>>,
-    }
-
-    impl PulseSampler for MockPulseSampler {
-        fn start(&self, _tx: std::sync::mpsc::Sender<PulseEvent>) -> Result<SamplerHandle> {
-            if let Ok(mut calls) = self.calls.lock() {
-                calls.push(PulseSamplerCall {
-                    method: "start".to_string(),
-                });
-            }
-            Ok(SamplerHandle)
-        }
-    }
 
     #[derive(Debug, Clone)]
     pub struct NormalizerCall {
@@ -970,7 +894,12 @@ pub mod mocks {
             Ok(next)
         }
 
-        fn append_raw_from(&self, event: RawEvent, _transport: &str, record_id: &str) -> Result<Offset> {
+        fn append_raw_from(
+            &self,
+            event: RawEvent,
+            _transport: &str,
+            record_id: &str,
+        ) -> Result<Offset> {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(StreamProviderCall {
                     method: "append_raw_from".to_string(),
@@ -1188,7 +1117,11 @@ pub mod mocks {
     }
 
     impl TriggerCondition for MockTriggerCondition {
-        fn evaluate(&self, _unit: &crate::KnowledgeUnit, _store: &dyn KnowledgeStore) -> Result<bool> {
+        fn evaluate(
+            &self,
+            _unit: &crate::KnowledgeUnit,
+            _store: &dyn KnowledgeStore,
+        ) -> Result<bool> {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(TriggerConditionCall {
                     method: "evaluate".to_string(),
@@ -1308,7 +1241,7 @@ pub mod mocks {
 
         let unit = crate::KnowledgeUnit {
             id,
-            source: SourceId::new("obsidian"),
+            source: crate::SourceId::new("obsidian"),
             content: "hello".to_string(),
             title: Some("note".to_string()),
             metadata: HashMap::new(),

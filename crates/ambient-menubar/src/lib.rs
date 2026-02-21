@@ -12,9 +12,9 @@ pub enum AmbientDeepLink {
 }
 
 pub fn parse_ambient_deep_link(url: &str) -> Result<AmbientDeepLink> {
-    let without_scheme = url
-        .strip_prefix("ambient://")
-        .ok_or_else(|| CoreError::InvalidInput("deep link must start with ambient://".to_string()))?;
+    let without_scheme = url.strip_prefix("ambient://").ok_or_else(|| {
+        CoreError::InvalidInput("deep link must start with ambient://".to_string())
+    })?;
 
     if let Some(id_str) = without_scheme.strip_prefix("unit/") {
         let id = Uuid::parse_str(id_str)
@@ -27,7 +27,7 @@ pub fn parse_ambient_deep_link(url: &str) -> Result<AmbientDeepLink> {
     ))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct OverlayState {
     pub visible: bool,
     pub query_text: String,
@@ -35,19 +35,6 @@ pub struct OverlayState {
     pub selected_index: usize,
     pub focused_unit: Option<Uuid>,
     pub last_query_at: Option<Instant>,
-}
-
-impl Default for OverlayState {
-    fn default() -> Self {
-        Self {
-            visible: false,
-            query_text: String::new(),
-            results: Vec::new(),
-            selected_index: 0,
-            focused_unit: None,
-            last_query_at: None,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -217,7 +204,7 @@ impl MenubarController {
 pub fn start_native_runtime(controller: Arc<MenubarController>) -> Result<MenubarRuntimeHandle> {
     #[cfg(target_os = "macos")]
     {
-        return macos_runtime::start(controller);
+        macos_runtime::start(controller)
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -237,7 +224,7 @@ pub fn badge_for(result: &QueryResult) -> Vec<&'static str> {
             badges.push("📞 On Call");
         }
         if let Some(hour) = state.time_of_day {
-            if hour >= 22 || hour < 6 {
+            if !(6..22).contains(&hour) {
                 badges.push("🌙 Late Night");
             }
             if (5..8).contains(&hour) {
@@ -255,8 +242,8 @@ mod macos_runtime {
 
     use core_foundation::runloop::CFRunLoop;
     use core_graphics::event::{
-        CallbackResult, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapPlacement,
-        CGEventTapOptions, CGEventType, EventField, KeyCode,
+        CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+        CGEventType, CallbackResult, EventField, KeyCode,
     };
     use objc2::rc::autoreleasepool;
     use objc2::runtime::AnyObject;
@@ -280,7 +267,8 @@ mod macos_runtime {
     fn run_event_tap_loop(controller: Arc<MenubarController>) {
         autoreleasepool(|_| {
             // Accessory app => no dock icon, no persistent app window.
-            let app: *mut AnyObject = unsafe { msg_send![class!(NSApplication), sharedApplication] };
+            let app: *mut AnyObject =
+                unsafe { msg_send![class!(NSApplication), sharedApplication] };
             if !app.is_null() {
                 let _: bool = unsafe { msg_send![app, setActivationPolicy: 1isize] };
             }
@@ -310,9 +298,7 @@ mod macos_runtime {
             CFRunLoop::run_current,
         );
 
-        if install.is_err() {
-            return;
-        }
+        let _ = install;
     }
 }
 
@@ -348,18 +334,14 @@ mod tests {
             observed_at: Utc::now(),
             content_hash: [1; 32],
         };
-        engine
-            .results
-            .lock()
-            .expect("lock")
-            .push(QueryResult {
-                unit: unit.clone(),
-                score: 1.0,
-                pulse_context: None,
-                cognitive_state: None,
-                historical_feedback_score: 0.5,
-                capability_status: None,
-            });
+        engine.results.lock().expect("lock").push(QueryResult {
+            unit: unit.clone(),
+            score: 1.0,
+            pulse_context: None,
+            cognitive_state: None,
+            historical_feedback_score: 0.5,
+            capability_status: None,
+        });
         let gate = MockLicenseGate {
             is_pro_user: true,
             expired_at: None,

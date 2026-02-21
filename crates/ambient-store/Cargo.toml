@@ -9,5 +9,6 @@ chrono = "0.4"
 cozo = "0.7.6"
 rayon = "=1.5.3"
 serde_json = "1"
+tracing = "0.1"
 tsink = { path = "../tsink" }
 uuid = "1"

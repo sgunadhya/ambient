@@ -3,9 +3,9 @@ use std::fs;
 use std::sync::mpsc;
 use std::time::Duration;
 
-use ambient_core::{KnowledgeStore, SourceAdapter};
+use ambient_core::KnowledgeStore;
 use ambient_normalizer::default_dispatch;
-use ambient_store::LadybugStore;
+use ambient_store::CozoStore;
 use ambient_watcher::ObsidianAdapter;
 
 fn mk_temp_vault() -> std::path::PathBuf {
@@ -27,7 +27,7 @@ fn phase1_obsidian_ingestion_and_links() {
     adapter.watch(tx).expect("watch starts");
 
     let dispatch = default_dispatch();
-    let store = LadybugStore::new().expect("store");
+    let store = CozoStore::new().expect("store");
 
     let mut units = Vec::new();
     while units.len() < 3 {
@@ -38,7 +38,9 @@ fn phase1_obsidian_ingestion_and_links() {
     }
 
     if let Some(first) = units.first() {
-        store.upsert(first.clone()).expect("re-upsert to index links");
+        store
+            .upsert(first.clone())
+            .expect("re-upsert to index links");
     }
 
     let all = store.search_fulltext("").expect("search");

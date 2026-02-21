@@ -51,8 +51,14 @@ pub fn fetch_changes_native(request: NativeFetchRequest) -> Result<CloudKitPushP
         return payload_from_bytes(&request.raw_payload);
     }
 
-    let _scope = (&request.container, &request.zone_name, &request.previous_token);
-    Err(CoreError::Unsupported("native cloudkit fetch op wiring pending"))
+    let _scope = (
+        &request.container,
+        &request.zone_name,
+        &request.previous_token,
+    );
+    Err(CoreError::Unsupported(
+        "native cloudkit fetch op wiring pending",
+    ))
 }
 
 #[cfg(not(all(target_os = "macos", feature = "cloudkit-native")))]
@@ -65,7 +71,11 @@ pub fn fetch_changes_native(request: NativeFetchRequest) -> Result<CloudKitPushP
         return payload_from_bytes(&request.raw_payload);
     }
 
-    let _scope = (&request.container, &request.zone_name, &request.previous_token);
+    let _scope = (
+        &request.container,
+        &request.zone_name,
+        &request.previous_token,
+    );
     Err(CoreError::Unsupported(
         "native cloudkit bridge unavailable in this build",
     ))
@@ -83,7 +93,7 @@ fn run_external_bridge(request: &NativeFetchRequest) -> Result<Option<CloudKitPu
                 .map(|v| v.trim().to_string())
                 .filter(|v| !v.is_empty())
         });
-    let cmd = cmd;
+
     let Some(cmd) = cmd else {
         return Ok(None);
     };
@@ -111,9 +121,9 @@ fn run_external_bridge(request: &NativeFetchRequest) -> Result<Option<CloudKitPu
             .stdin
             .take()
             .ok_or_else(|| CoreError::Internal("native bridge stdin unavailable".to_string()))?;
-        stdin
-            .write_all(&input)
-            .map_err(|e| CoreError::Internal(format!("failed writing native bridge request: {e}")))?;
+        stdin.write_all(&input).map_err(|e| {
+            CoreError::Internal(format!("failed writing native bridge request: {e}"))
+        })?;
     }
 
     let output = child
@@ -138,6 +148,8 @@ fn run_external_bridge(request: &NativeFetchRequest) -> Result<Option<CloudKitPu
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use ambient_core::CoreError;
 
     use super::{build_fetch_request, fetch_changes_native};
@@ -173,7 +185,6 @@ mod tests {
 
     #[test]
     fn non_structured_payload_without_bridge_is_unsupported() {
-        std::env::remove_var("AMBIENT_CLOUDKIT_NATIVE_BRIDGE_CMD");
         let req = build_fetch_request(
             b"\x00\x01\x02",
             "iCloud.dev.ambient.private",
@@ -184,5 +195,43 @@ mod tests {
         .expect("request");
         let err = fetch_changes_native(req).expect_err("should fail");
         assert!(matches!(err, CoreError::Unsupported(_)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn configured_bridge_command_handles_non_structured_payload() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let script_path = std::env::temp_dir().join(format!(
+            "ambient-cloudkit-bridge-{}-{nanos}",
+            std::process::id()
+        ));
+        fs::write(
+            &script_path,
+            "#!/bin/sh\ncat >/dev/null\necho '{\"new_change_token\":\"tok-cmd\",\"records\":[]}'\n",
+        )
+        .expect("write script");
+        let mut perms = fs::metadata(&script_path).expect("metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&script_path, perms).expect("chmod");
+
+        let req = build_fetch_request(
+            b"\x00\x01\x02",
+            "iCloud.dev.ambient.private",
+            "AmbientZone",
+            Some("tok-prev"),
+            Some(script_path.to_string_lossy().as_ref()),
+        )
+        .expect("request");
+        let mapped = fetch_changes_native(req).expect("mapped");
+        let _ = fs::remove_file(&script_path);
+
+        assert_eq!(mapped.new_change_token.as_deref(), Some("tok-cmd"));
+        assert!(mapped.records.is_empty());
     }
 }

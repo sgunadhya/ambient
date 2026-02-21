@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 
 use ambient_core::{KnowledgeStore, KnowledgeUnit, PulseEvent, PulseSignal, SourceId};
-use ambient_store::LadybugStore;
+use ambient_store::CozoStore;
 use chrono::Utc;
 
 #[test]
 fn phase2_unit_with_context_derives_state() {
-    let store = LadybugStore::new().expect("store");
+    let store = CozoStore::new().expect("store");
     let observed_at = Utc::now();
     let id = uuid::Uuid::new_v4();
 

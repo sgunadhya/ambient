@@ -1,8 +1,8 @@
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::{env, net::SocketAddr, path::PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
+use std::{env, net::SocketAddr, path::PathBuf};
 
 use ambient_cli::{
     open_default_stream_provider, run_doctor, run_http_server, run_setup, AmbientConfig,
@@ -12,17 +12,17 @@ use ambient_core::{
     GatedFeature, License, LicenseError, LicenseGate, LoadAware, QueryResult, SpotlightExporter,
     SystemLoad, TransportState,
 };
-use ambient_menubar::{parse_ambient_deep_link, start_native_runtime, AmbientDeepLink, MenubarController};
+use ambient_menubar::{
+    parse_ambient_deep_link, start_native_runtime, AmbientDeepLink, MenubarController,
+};
 use ambient_normalizer::{default_dispatch, NormalizerConsumer};
 use ambient_onboard::InMemoryCapabilityGate;
 use ambient_patterns::PatternScheduler;
 use ambient_query::build_runtime_components_with_weights;
 use ambient_reasoning::{EmbeddingQueue, RigReasoningEngine};
 use ambient_spotlight::CoreSpotlightExporter;
+use ambient_transport_local::{DefaultLoadPolicyProvider, LoadBroadcaster, SystemLoadSampler};
 use ambient_triggers::TriggerEngine;
-use ambient_watcher::{
-    DefaultLoadPolicyProvider, LoadBroadcaster, SystemLoadSampler,
-};
 use clap::{Parser, Subcommand};
 use reqwest::blocking::Client;
 use serde::Serialize;
@@ -133,7 +133,12 @@ impl RuntimeLoadTracker {
     }
 
     fn current(&self) -> String {
-        match self.state.lock().map(|s| *s).unwrap_or(SystemLoad::Conservative) {
+        match self
+            .state
+            .lock()
+            .map(|s| *s)
+            .unwrap_or(SystemLoad::Conservative)
+        {
             SystemLoad::Unconstrained => "unconstrained".to_string(),
             SystemLoad::Conservative => "conservative".to_string(),
             SystemLoad::Minimal => "minimal".to_string(),
@@ -235,19 +240,38 @@ fn run() -> Result<(), String> {
             let config = AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
             let daemon_pid_path = default_daemon_pid_path()?;
             let _pid_guard = DaemonPidGuard::create(daemon_pid_path)?;
-            let (engine, store) =
-                build_runtime_components_with_weights(config.semantic_weight, config.feedback_weight)
-                    .map_err(|e| e.to_string())?;
+            let (engine, store) = build_runtime_components_with_weights(
+                config.semantic_weight,
+                config.feedback_weight,
+            )
+            .map_err(|e| e.to_string())?;
 
             let dispatch = Arc::new(default_dispatch());
             let spotlight_exporter = Arc::new(CoreSpotlightExporter::default());
             let stream_provider = open_default_stream_provider().map_err(|e| e.to_string())?;
-            let transport_registry = Arc::new(TransportRegistry::from_config(&config));
-            let reasoning = Arc::new(RigReasoningEngine::new(ambient_core::ReasoningBackend::Local {
-                ollama_base_url: "http://localhost:11434".to_string(),
-            }));
+
+            let reasoning = Arc::new(RigReasoningEngine::new(
+                ambient_core::ReasoningBackend::Local {
+                    ollama_base_url: "http://localhost:11434".to_string(),
+                },
+            ));
             reasoning.start_ollama_probe();
             let embedding_queue = Arc::new(EmbeddingQueue::new(store.clone(), reasoning.clone()));
+
+            let broadcaster = Arc::new(LoadBroadcaster::default());
+            broadcaster.register(embedding_queue.clone() as Arc<dyn LoadAware>);
+            let load_tracker = Arc::new(RuntimeLoadTracker::new());
+            broadcaster.register(load_tracker.clone() as Arc<dyn LoadAware>);
+            let system_load = Arc::new(SystemLoadSampler::new(
+                Arc::new(DefaultLoadPolicyProvider),
+                broadcaster.clone(),
+            ));
+            system_load
+                .start()
+                .map_err(|e: ambient_core::CoreError| e.to_string())?;
+
+            let transport_registry =
+                Arc::new(TransportRegistry::from_config(&config, broadcaster.clone()));
             let trigger_path = default_triggers_path()?;
             let triggers = Arc::new(
                 TriggerEngine::load_from_path(store.clone(), &trigger_path)
@@ -303,15 +327,6 @@ fn run() -> Result<(), String> {
                 }
             });
 
-            let broadcaster = Arc::new(LoadBroadcaster::default());
-            broadcaster.register(embedding_queue.clone() as Arc<dyn LoadAware>);
-            let load_tracker = Arc::new(RuntimeLoadTracker::new());
-            broadcaster.register(load_tracker.clone() as Arc<dyn LoadAware>);
-            let system_load = Arc::new(SystemLoadSampler::new(
-                Arc::new(DefaultLoadPolicyProvider),
-                broadcaster.clone(),
-            ));
-            let _system_load_handle = system_load.start().map_err(|e| e.to_string())?;
             let mut active_samplers = Vec::new();
             if config.context_switches {
                 active_samplers.push("context_switches".to_string());
@@ -325,14 +340,11 @@ fn run() -> Result<(), String> {
             let pulse_provider = stream_provider.clone();
             let pulse_store = store.clone();
             std::thread::spawn(move || {
-                let consumer = match PulseConsumer::new(
-                    pulse_provider,
-                    pulse_store,
-                    "pulse".to_string(),
-                ) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
+                let consumer =
+                    match PulseConsumer::new(pulse_provider, pulse_store, "pulse".to_string()) {
+                        Ok(c) => c,
+                        Err(_) => return,
+                    };
                 loop {
                     let count = consumer.poll_once(200).unwrap_or(0);
                     if count == 0 {
@@ -382,9 +394,7 @@ fn run() -> Result<(), String> {
                 },
             ));
             let stop_result = transport_registry.stop_all().map_err(|e| e.to_string());
-            run_result
-                .map_err(|e| e.to_string())
-                .and(stop_result)
+            run_result.map_err(|e| e.to_string()).and(stop_result)
         }
         Commands::Query {
             text,
@@ -464,8 +474,12 @@ fn run() -> Result<(), String> {
             transport,
             payload_file,
         } => {
-            let payload = std::fs::read_to_string(&payload_file)
-                .map_err(|e| format!("failed reading payload file {}: {e}", payload_file.display()))?;
+            let payload = std::fs::read_to_string(&payload_file).map_err(|e| {
+                format!(
+                    "failed reading payload file {}: {e}",
+                    payload_file.display()
+                )
+            })?;
             post_raw_json(
                 &cli.server,
                 cli.token.as_deref(),
@@ -539,7 +553,12 @@ fn post_json<T: Serialize>(
     print_response(response)
 }
 
-fn post_raw_json(server: &str, token: Option<&str>, path: &str, payload: String) -> Result<(), String> {
+fn post_raw_json(
+    server: &str,
+    token: Option<&str>,
+    path: &str,
+    payload: String,
+) -> Result<(), String> {
     let url = format!("{}{}", server.trim_end_matches('/'), path);
     let client = Client::new();
     let mut req = client
@@ -555,7 +574,9 @@ fn post_raw_json(server: &str, token: Option<&str>, path: &str, payload: String)
 
 fn print_response(response: reqwest::blocking::Response) -> Result<(), String> {
     let status = response.status();
-    let body = response.text().map_err(|e| format!("failed reading response: {e}"))?;
+    let body = response
+        .text()
+        .map_err(|e| format!("failed reading response: {e}"))?;
     if status.is_success() {
         println!("{body}");
         Ok(())
@@ -642,7 +663,10 @@ fn open_url(server: &str, token: Option<&str>, url: &str) -> Result<(), String> 
     }
 }
 
-fn fetch_transport_doctor(server: &str, token: Option<&str>) -> Result<Option<Vec<String>>, String> {
+fn fetch_transport_doctor(
+    server: &str,
+    token: Option<&str>,
+) -> Result<Option<Vec<String>>, String> {
     let url = format!("{}/health", server.trim_end_matches('/'));
     let client = Client::new();
     let mut req = client.get(url);
@@ -659,8 +683,8 @@ fn fetch_transport_doctor(server: &str, token: Option<&str>) -> Result<Option<Ve
     let body = resp
         .text()
         .map_err(|e| format!("failed reading /health response: {e}"))?;
-    let parsed: HealthResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("invalid /health payload: {e}"))?;
+    let parsed: HealthResponse =
+        serde_json::from_str(&body).map_err(|e| format!("invalid /health payload: {e}"))?;
 
     let mut out = Vec::new();
     out.push("Transport Status".to_string());

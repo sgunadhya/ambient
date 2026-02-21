@@ -2,21 +2,18 @@ use std::collections::HashMap;
 use std::sync::{mpsc, Mutex};
 use std::thread;
 
-use ambient_core::{
-    CoreError, KnowledgeUnit, RawEvent, Result, SourceAdapter, SourceId, SpotlightExporter,
-    WatchHandle,
-};
+use ambient_core::{CoreError, KnowledgeUnit, RawEvent, Result, SourceId, SpotlightExporter};
 use objc2::rc::autoreleasepool;
 use uuid::Uuid;
 
 pub struct SpotlightAdapter;
 
-impl SourceAdapter for SpotlightAdapter {
-    fn source_id(&self) -> SourceId {
+impl SpotlightAdapter {
+    pub fn source_id(&self) -> SourceId {
         SourceId::new("spotlight")
     }
 
-    fn watch(&self, tx: mpsc::Sender<RawEvent>) -> Result<WatchHandle> {
+    pub fn watch(&self, tx: mpsc::Sender<RawEvent>) -> Result<()> {
         #[cfg(target_os = "macos")]
         {
             thread::Builder::new()
@@ -34,7 +31,7 @@ impl SourceAdapter for SpotlightAdapter {
             let _ = tx;
         }
 
-        Ok(WatchHandle)
+        Ok(())
     }
 }
 
@@ -140,7 +137,9 @@ mod macos_bridge {
         objc2::rc::autoreleasepool(|_| {
             let query: *mut AnyObject = unsafe { msg_send![class!(NSMetadataQuery), new] };
             if query.is_null() {
-                return Err(CoreError::Internal("NSMetadataQuery init failed".to_string()));
+                return Err(CoreError::Internal(
+                    "NSMetadataQuery init failed".to_string(),
+                ));
             }
 
             let pattern = nsstring("kMDItemTextContent != NULL");
@@ -195,7 +194,9 @@ mod macos_bridge {
 
             let started: bool = unsafe { msg_send![query, startQuery] };
             if !started {
-                return Err(CoreError::Internal("failed to start NSMetadataQuery".to_string()));
+                return Err(CoreError::Internal(
+                    "failed to start NSMetadataQuery".to_string(),
+                ));
             }
 
             // Keep blocks alive for callback lifetime.
@@ -203,7 +204,8 @@ mod macos_bridge {
             std::mem::forget(finish_block);
 
             loop {
-                let run_loop: *mut AnyObject = unsafe { msg_send![class!(NSRunLoop), currentRunLoop] };
+                let run_loop: *mut AnyObject =
+                    unsafe { msg_send![class!(NSRunLoop), currentRunLoop] };
                 if run_loop.is_null() {
                     break;
                 }
@@ -243,7 +245,8 @@ mod macos_bridge {
             let file_path = metadata_string(item, "kMDItemPath");
             let file_url = file_path.as_ref().map(|path| format!("file://{path}"));
 
-            let modified = metadata_date(item, "kMDItemFSContentChangeDate").unwrap_or_else(Utc::now);
+            let modified =
+                metadata_date(item, "kMDItemFSContentChangeDate").unwrap_or_else(Utc::now);
             let dedupe_key = format!(
                 "{}:{}",
                 file_url.clone().unwrap_or_else(|| display_name.clone()),
@@ -279,14 +282,18 @@ mod macos_bridge {
         let attribute_set: *mut AnyObject =
             unsafe { msg_send![class!(CSSearchableItemAttributeSet), alloc] };
         if attribute_set.is_null() {
-            return Err(CoreError::Internal("failed to allocate attribute set".to_string()));
+            return Err(CoreError::Internal(
+                "failed to allocate attribute set".to_string(),
+            ));
         }
 
         let content_type = nsstring("public.text");
         let attribute_set: *mut AnyObject =
             unsafe { msg_send![attribute_set, initWithItemContentType: content_type] };
         if attribute_set.is_null() {
-            return Err(CoreError::Internal("failed to init attribute set".to_string()));
+            return Err(CoreError::Internal(
+                "failed to init attribute set".to_string(),
+            ));
         }
 
         if let Some(title) = &doc.title {
@@ -299,7 +306,8 @@ mod macos_bridge {
 
         if let Some(first_keyword) = doc.keywords.first() {
             let keyword = nsstring(first_keyword);
-            let arr: *mut AnyObject = unsafe { msg_send![class!(NSArray), arrayWithObject: keyword] };
+            let arr: *mut AnyObject =
+                unsafe { msg_send![class!(NSArray), arrayWithObject: keyword] };
             if !arr.is_null() {
                 let _: () = unsafe { msg_send![attribute_set, setKeywords: arr] };
             }
@@ -315,25 +323,33 @@ mod macos_bridge {
         let domain = nsstring("ambient.unit");
         let item_alloc: *mut AnyObject = unsafe { msg_send![class!(CSSearchableItem), alloc] };
         if item_alloc.is_null() {
-            return Err(CoreError::Internal("failed to allocate searchable item".to_string()));
+            return Err(CoreError::Internal(
+                "failed to allocate searchable item".to_string(),
+            ));
         }
 
         let item: *mut AnyObject = unsafe {
             msg_send![item_alloc, initWithUniqueIdentifier: identifier, domainIdentifier: domain, attributeSet: attribute_set]
         };
         if item.is_null() {
-            return Err(CoreError::Internal("failed to initialize searchable item".to_string()));
+            return Err(CoreError::Internal(
+                "failed to initialize searchable item".to_string(),
+            ));
         }
 
         let array: *mut AnyObject = unsafe { msg_send![class!(NSArray), arrayWithObject: item] };
         if array.is_null() {
-            return Err(CoreError::Internal("failed to create searchable item array".to_string()));
+            return Err(CoreError::Internal(
+                "failed to create searchable item array".to_string(),
+            ));
         }
 
         let index: *mut AnyObject =
             unsafe { msg_send![class!(CSSearchableIndex), defaultSearchableIndex] };
         if index.is_null() {
-            return Err(CoreError::Internal("failed to get default searchable index".to_string()));
+            return Err(CoreError::Internal(
+                "failed to get default searchable index".to_string(),
+            ));
         }
 
         let _: () = unsafe {
@@ -345,7 +361,8 @@ mod macos_bridge {
 
     pub fn delete_document(id: Uuid) -> Result<()> {
         let identifier = nsstring(&id.to_string());
-        let ids: *mut AnyObject = unsafe { msg_send![class!(NSArray), arrayWithObject: identifier] };
+        let ids: *mut AnyObject =
+            unsafe { msg_send![class!(NSArray), arrayWithObject: identifier] };
         if ids.is_null() {
             return Err(CoreError::Internal("failed to create id array".to_string()));
         }
@@ -353,7 +370,9 @@ mod macos_bridge {
         let index: *mut AnyObject =
             unsafe { msg_send![class!(CSSearchableIndex), defaultSearchableIndex] };
         if index.is_null() {
-            return Err(CoreError::Internal("failed to get default searchable index".to_string()));
+            return Err(CoreError::Internal(
+                "failed to get default searchable index".to_string(),
+            ));
         }
 
         let _: () = unsafe {
@@ -396,6 +415,10 @@ mod macos_bridge {
         if utf8.is_null() {
             return None;
         }
-        Some(unsafe { CStr::from_ptr(utf8) }.to_string_lossy().to_string())
+        Some(
+            unsafe { CStr::from_ptr(utf8) }
+                .to_string_lossy()
+                .to_string(),
+        )
     }
 }

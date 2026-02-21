@@ -1,0 +1,17 @@
+syntax = "proto3";
+package applenotes;
+
+message Document {
+    repeated Node nodes = 1;
+}
+
+message Node {
+    string type = 1;
+    string text = 2;
+    repeated Attribute attributes = 3;
+}
+
+message Attribute {
+    string key = 1;
+    string value = 2;
+}

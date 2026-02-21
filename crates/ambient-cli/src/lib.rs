@@ -5,35 +5,31 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use ambient_core::{
-    CapabilityGate, CapabilityStatus, FeedbackEvent, FeedbackSignal, GatedCapability, KnowledgeStore,
-    KnowledgeUnit, LoadAware, PulseEvent, PulseSampler, PulseSignal, QueryEngine, QueryRequest,
-    QueryResult, Result, SamplerHandle, SourceId, StreamProvider, StreamTransport, TransportStatus,
-    ConsumerId, Offset, EventLogEntry,
+    CapabilityGate, CapabilityStatus, ConsumerId, EventLogEntry, FeedbackEvent, FeedbackSignal,
+    GatedCapability, KnowledgeStore, KnowledgeUnit, LoadAware, Offset, PulseEvent, PulseSignal,
+    QueryEngine, QueryRequest, QueryResult, Result, SourceId, StreamProvider, StreamTransport,
+    TransportStatus,
 };
 use ambient_onboard::{HealthCheck, SetupWizard};
 use ambient_stream::SqliteStreamProvider;
 use ambient_transport_bonjour::BonjourTransport;
 use ambient_transport_cloudkit::{CloudKitTransport, JsonPayloadFetcher};
 use ambient_transport_google_health::GoogleHealthTransport;
-use ambient_transport_local::LocalTransport;
-use ambient_watcher::{
-    ActiveAppSampler, AudioInputSampler, ContextSwitchSampler, LoadBroadcaster, SystemLoadSampler,
+use ambient_transport_local::{
+    ActiveAppTransport, AudioInputTransport, CalendarContextTransport, CalendarTransport,
+    ContextSwitchTransport, DefaultActiveAppProvider, DefaultCalendarProvider,
+    DefaultHealthKitProvider, HealthKitTransport, LoadBroadcaster, ObsidianTransport,
+    WatchAudioInputSource,
 };
+use axum::body::Bytes;
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum::body::Bytes;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
-
-pub struct DaemonSamplers {
-    pub context_switch: Option<Arc<ContextSwitchSampler>>,
-    pub active_app: Option<Arc<ActiveAppSampler>>,
-    pub audio_input: Option<Arc<AudioInputSampler>>,
-}
 
 pub struct TransportRegistry {
     transports: Vec<Arc<dyn StreamTransport>>,
@@ -50,14 +46,44 @@ impl Default for TransportRegistry {
 }
 
 impl TransportRegistry {
-    pub fn from_config(config: &AmbientConfig) -> Self {
-        let mut transports: Vec<Arc<dyn StreamTransport>> = vec![Arc::new(LocalTransport::new(
+    pub fn from_config(config: &AmbientConfig, broadcaster: Arc<LoadBroadcaster>) -> Self {
+        let mut transports: Vec<Arc<dyn StreamTransport>> = vec![Arc::new(ObsidianTransport::new(
             config.obsidian_vault.clone(),
-            config.spotlight,
-            config.context_switches,
-            config.active_app_titles,
-            config.audio_input,
         ))];
+        if config.healthkit {
+            transports.push(Arc::new(HealthKitTransport::new(Arc::new(
+                DefaultHealthKitProvider,
+            ))));
+        }
+        if config.calendar {
+            transports.push(Arc::new(CalendarTransport::new(Arc::new(
+                DefaultCalendarProvider,
+            ))));
+            let calendar_context = Arc::new(CalendarContextTransport::new(Arc::new(
+                DefaultCalendarProvider,
+            )));
+            broadcaster.register(calendar_context.clone() as Arc<dyn LoadAware>);
+            transports.push(calendar_context);
+        }
+        if config.context_switches {
+            let context_switch = Arc::new(ContextSwitchTransport::new(Arc::new(
+                DefaultActiveAppProvider,
+            )));
+            broadcaster.register(context_switch.clone() as Arc<dyn LoadAware>);
+            transports.push(context_switch);
+        }
+        if config.active_app_titles {
+            let active_app = Arc::new(ActiveAppTransport::new(Arc::new(DefaultActiveAppProvider)));
+            broadcaster.register(active_app.clone() as Arc<dyn LoadAware>);
+            transports.push(active_app);
+        }
+        if config.audio_input {
+            let audio_input = Arc::new(AudioInputTransport::new(Arc::new(
+                WatchAudioInputSource::new(false),
+            )));
+            broadcaster.register(audio_input.clone() as Arc<dyn LoadAware>);
+            transports.push(audio_input);
+        }
         if config.bonjour {
             transports.push(Arc::new(BonjourTransport::default()));
         }
@@ -94,10 +120,9 @@ impl TransportRegistry {
     }
 
     pub fn start_all(&self, provider: Arc<dyn StreamProvider>) -> Result<()> {
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| ambient_core::CoreError::Internal("transport handles lock poisoned".to_string()))?;
+        let mut handles = self.handles.lock().map_err(|_| {
+            ambient_core::CoreError::Internal("transport handles lock poisoned".to_string())
+        })?;
         handles.clear();
         for transport in &self.transports {
             let path = transport_state_path(&transport.transport_id())?;
@@ -131,10 +156,9 @@ impl TransportRegistry {
             }
             transport.stop()?;
         }
-        let mut handles = self
-            .handles
-            .lock()
-            .map_err(|_| ambient_core::CoreError::Internal("transport handles lock poisoned".to_string()))?;
+        let mut handles = self.handles.lock().map_err(|_| {
+            ambient_core::CoreError::Internal("transport handles lock poisoned".to_string())
+        })?;
         for handle in handles.drain(..) {
             handle.abort();
         }
@@ -175,13 +199,6 @@ fn transport_state_path(transport_id: &str) -> Result<PathBuf> {
         .join(transport_id))
 }
 
-pub struct DaemonHandles {
-    pub context_switch: Option<SamplerHandle>,
-    pub active_app: Option<SamplerHandle>,
-    pub audio_input: Option<SamplerHandle>,
-    pub system_load: SamplerHandle,
-}
-
 pub struct PulseConsumer {
     provider: Arc<dyn StreamProvider>,
     store: Arc<dyn KnowledgeStore>,
@@ -205,10 +222,9 @@ impl PulseConsumer {
     }
 
     pub fn poll_once(&self, limit: usize) -> Result<usize> {
-        let mut offset = self
-            .offset
-            .lock()
-            .map_err(|_| ambient_core::CoreError::Internal("pulse consumer offset lock poisoned".to_string()))?;
+        let mut offset = self.offset.lock().map_err(|_| {
+            ambient_core::CoreError::Internal("pulse consumer offset lock poisoned".to_string())
+        })?;
         let batch = self.provider.read(&self.consumer_id, *offset, limit)?;
         let mut written = 0usize;
 
@@ -475,8 +491,9 @@ impl AmbientConfig {
     }
 
     pub fn from_path(path: &Path) -> Result<Self> {
-        let raw = fs::read_to_string(path)
-            .map_err(|e| ambient_core::CoreError::Internal(format!("failed to read config: {e}")))?;
+        let raw = fs::read_to_string(path).map_err(|e| {
+            ambient_core::CoreError::Internal(format!("failed to read config: {e}"))
+        })?;
         let parsed: ConfigFile = toml::from_str(&raw).map_err(|e| {
             ambient_core::CoreError::InvalidInput(format!("invalid config TOML: {e}"))
         })?;
@@ -502,67 +519,30 @@ impl AmbientConfig {
             cloudkit_container: parsed.cloudkit.container,
             cloudkit_zone_name: parsed.cloudkit.zone_name,
             cloudkit_native_bridge: parsed.cloudkit.native_bridge,
-            cloudkit_native_bridge_cmd: parsed
-                .cloudkit
-                .native_bridge_cmd
-                .and_then(|cmd| if cmd.trim().is_empty() { None } else { Some(cmd) }),
+            cloudkit_native_bridge_cmd: parsed.cloudkit.native_bridge_cmd.and_then(|cmd| {
+                if cmd.trim().is_empty() {
+                    None
+                } else {
+                    Some(cmd)
+                }
+            }),
             http_port: parsed.daemon.http_port,
-            auth_token: parsed
-                .daemon
-                .auth_token
-                .and_then(|token| if token.trim().is_empty() { None } else { Some(token) }),
+            auth_token: parsed.daemon.auth_token.and_then(|token| {
+                if token.trim().is_empty() {
+                    None
+                } else {
+                    Some(token)
+                }
+            }),
         })
     }
 }
 
-pub fn start_pulse_pipeline(
-    provider: Arc<dyn StreamProvider>,
-    samplers: DaemonSamplers,
-    system_load_sampler: Arc<SystemLoadSampler>,
-    broadcaster: Arc<LoadBroadcaster>,
-) -> Result<DaemonHandles> {
-    let mut components: Vec<Arc<dyn LoadAware>> = Vec::new();
-    if let Some(context) = &samplers.context_switch {
-        components.push(context.clone() as Arc<dyn LoadAware>);
-    }
-    if let Some(active) = &samplers.active_app {
-        components.push(active.clone() as Arc<dyn LoadAware>);
-    }
-    if let Some(audio) = &samplers.audio_input {
-        components.push(audio.clone() as Arc<dyn LoadAware>);
-    }
-    register_load_aware_components(&broadcaster, components);
-
-    let (pulse_tx, pulse_rx) = std::sync::mpsc::channel();
-    let context_switch = match samplers.context_switch {
-        Some(s) => Some(s.start(pulse_tx.clone())?),
-        None => None,
-    };
-    let active_app = match samplers.active_app {
-        Some(s) => Some(s.start(pulse_tx.clone())?),
-        None => None,
-    };
-    let audio_input = match samplers.audio_input {
-        Some(s) => Some(s.start(pulse_tx)?),
-        None => None,
-    };
-    let system_load = system_load_sampler.start()?;
-
-    std::thread::spawn(move || {
-        for event in pulse_rx {
-            let _ = provider.append_pulse(event);
-        }
-    });
-
-    Ok(DaemonHandles {
-        context_switch,
-        active_app,
-        audio_input,
-        system_load,
-    })
-}
-
-pub fn run_query(engine: &dyn QueryEngine, text: &str, with_pulse: bool) -> Result<Vec<QueryResult>> {
+pub fn run_query(
+    engine: &dyn QueryEngine,
+    text: &str,
+    with_pulse: bool,
+) -> Result<Vec<QueryResult>> {
     engine.query(QueryRequest {
         text: text.to_string(),
         k: 10,
@@ -581,7 +561,9 @@ pub fn run_doctor(gate: Arc<dyn CapabilityGate>) -> Vec<String> {
     check.status_lines()
 }
 
-pub fn capability_statuses(gate: &dyn CapabilityGate) -> HashMap<GatedCapability, CapabilityStatus> {
+pub fn capability_statuses(
+    gate: &dyn CapabilityGate,
+) -> HashMap<GatedCapability, CapabilityStatus> {
     let capabilities = [
         GatedCapability::SemanticSearch,
         GatedCapability::CognitiveBadges,
@@ -682,12 +664,6 @@ pub fn record_query_feedback(
 
     store.record_feedback(event.clone())?;
     Ok(event)
-}
-
-fn register_load_aware_components(broadcaster: &LoadBroadcaster, components: Vec<Arc<dyn LoadAware>>) {
-    for component in components {
-        broadcaster.register(component);
-    }
 }
 
 fn default_config_toml() -> &'static str {
@@ -879,7 +855,9 @@ async fn http_unit(
                     capability_status: None,
                 })
             }
-            None => Err(ambient_core::CoreError::NotFound(format!("unit {id} not found"))),
+            None => Err(ambient_core::CoreError::NotFound(format!(
+                "unit {id} not found"
+            ))),
         });
 
     map_result(result)
@@ -925,26 +903,25 @@ async fn http_health(State(state): State<HttpAppState>, headers: HeaderMap) -> R
         active_sources,
         active_samplers,
         transport_statuses,
-    ) =
-        match &state.status_probe {
-            Some(probe) => (
-                probe.embedding_available(),
-                probe.load(),
-                probe.queue_depth(),
-                probe.upserted_units(),
-                probe.active_sources(),
-                probe.active_samplers(),
-                probe.transport_statuses(),
-            ),
-            None => (
-                true,
-                "unconstrained".to_string(),
-                0,
-                0,
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-            ),
+    ) = match &state.status_probe {
+        Some(probe) => (
+            probe.embedding_available(),
+            probe.load(),
+            probe.queue_depth(),
+            probe.upserted_units(),
+            probe.active_sources(),
+            probe.active_samplers(),
+            probe.transport_statuses(),
+        ),
+        None => (
+            true,
+            "unconstrained".to_string(),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ),
     };
 
     let payload = HealthResponse {
@@ -970,7 +947,12 @@ async fn http_checkin(
     if let Err(resp) = authorize(&state.auth_token, &headers) {
         return resp;
     }
-    map_result(submit_checkin(state.store.as_ref(), req.energy, req.mood, req.note))
+    map_result(submit_checkin(
+        state.store.as_ref(),
+        req.energy,
+        req.mood,
+        req.note,
+    ))
 }
 
 async fn http_feedback(
@@ -1001,7 +983,11 @@ async fn http_open_unit(
     if let Ok(mut guard) = state.deep_link_focus.lock() {
         *guard = Some(id);
     }
-    (StatusCode::OK, Json(serde_json::json!({ "focused_unit": id }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "focused_unit": id })),
+    )
+        .into_response()
 }
 
 async fn http_get_focus(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
@@ -1009,7 +995,11 @@ async fn http_get_focus(State(state): State<HttpAppState>, headers: HeaderMap) -
         return resp;
     }
     let focused = state.deep_link_focus.lock().ok().and_then(|g| *g);
-    (StatusCode::OK, Json(serde_json::json!({ "focused_unit": focused }))).into_response()
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "focused_unit": focused })),
+    )
+        .into_response()
 }
 
 async fn http_transport_push(
@@ -1047,6 +1037,7 @@ async fn http_transport_push(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn authorize(token: &Option<String>, headers: &HeaderMap) -> std::result::Result<(), Response> {
     match token {
         Some(expected) => {
@@ -1057,7 +1048,11 @@ fn authorize(token: &Option<String>, headers: &HeaderMap) -> std::result::Result
             if actual == expected {
                 Ok(())
             } else {
-                Err((StatusCode::UNAUTHORIZED, "missing or invalid X-Ambient-Token").into_response())
+                Err((
+                    StatusCode::UNAUTHORIZED,
+                    "missing or invalid X-Ambient-Token",
+                )
+                    .into_response())
             }
         }
         None => Ok(()),
@@ -1081,6 +1076,7 @@ fn map_result<T: Serialize>(result: Result<T>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use ambient_transport_local::LoadBroadcaster;
     use std::collections::HashMap;
     use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1098,15 +1094,16 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        build_router, capability_statuses, record_query_feedback, run_doctor, run_setup, AmbientConfig,
-        HttpAppState, TransportRegistry, submit_checkin,
+        build_router, capability_statuses, record_query_feedback, run_doctor, run_setup,
+        submit_checkin, AmbientConfig, HttpAppState, TransportRegistry,
     };
 
     #[test]
     fn checkin_writes_unit_and_pulse() {
         let store = MockKnowledgeStore::default();
 
-        let unit = submit_checkin(&store, 4, 3, Some("deep work".to_string())).expect("checkin works");
+        let unit =
+            submit_checkin(&store, 4, 3, Some("deep work".to_string())).expect("checkin works");
 
         assert_eq!(unit.source.0, "self_report");
         assert!(unit.content.contains("Energy: 4/5"));
@@ -1473,13 +1470,14 @@ auth_token = ""
             google_health: false,
             ..AmbientConfig::default()
         };
-        let registry = TransportRegistry::from_config(&cfg);
+        let broadcaster = Arc::new(LoadBroadcaster::default());
+        let registry = TransportRegistry::from_config(&cfg, broadcaster);
         let ids = registry
             .status_all()
             .into_iter()
             .map(|s| s.transport_id)
             .collect::<Vec<_>>();
-        assert!(ids.iter().any(|id| id == "local"));
+        assert!(ids.iter().any(|id| id == "obsidian"));
         assert!(ids.iter().any(|id| id == "cloudkit"));
         assert!(!ids.iter().any(|id| id == "bonjour"));
         assert!(!ids.iter().any(|id| id == "google_health"));

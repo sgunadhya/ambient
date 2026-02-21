@@ -4,7 +4,7 @@ use ambient_core::{
     CapabilityGate, CapabilityStatus, CoreError, GatedCapability, KnowledgeStore, QueryEngine,
     QueryRequest, QueryResult, ReasoningEngine, Result,
 };
-use ambient_store::LadybugStore;
+use ambient_store::CozoStore;
 
 pub struct AmbientQueryEngine {
     store: Arc<dyn KnowledgeStore>,
@@ -174,7 +174,7 @@ pub fn build_runtime_components_with_weights(
     semantic_weight: f32,
     feedback_weight: f32,
 ) -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
-    let store: Arc<dyn KnowledgeStore> = Arc::new(LadybugStore::new()?);
+    let store: Arc<dyn KnowledgeStore> = Arc::new(CozoStore::new()?);
     let engine: Arc<dyn QueryEngine> = Arc::new(
         AmbientQueryEngine::new(store.clone(), None).with_weights(semantic_weight, feedback_weight),
     );

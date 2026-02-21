@@ -3,12 +3,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ambient_core::{
-    CoreError, Result, StreamProvider, StreamTransport, TransportId, TransportState, TransportStatus,
+    CoreError, Result, StreamProvider, StreamTransport, TransportId, TransportState,
+    TransportStatus,
 };
 use chrono::{DateTime, Utc};
 
-use crate::normalizer::{payload_from_bytes, record_to_raw_event, CloudKitPushPayload};
 use crate::native::NativeCloudKitFetcher;
+use crate::normalizer::{payload_from_bytes, record_to_raw_event, CloudKitPushPayload};
 use crate::token::{decode, encode, CloudKitTokenState};
 
 pub trait CloudKitChangeFetcher: Send + Sync {
@@ -119,7 +120,7 @@ impl CloudKitTransport {
             .lock()
             .map_err(|_| CoreError::Internal("cloudkit provider lock poisoned".to_string()))?
             .clone()
-            .ok_or_else(|| CoreError::Unsupported("cloudkit transport not started"))?;
+            .ok_or(CoreError::Unsupported("cloudkit transport not started"))?;
 
         let previous_token = self
             .change_token
@@ -146,11 +147,9 @@ impl CloudKitTransport {
                 Some(token);
         }
         if let Some(ts) = max_ts {
-            *self
-                .last_event_at
-                .lock()
-                .map_err(|_| CoreError::Internal("cloudkit last_event lock poisoned".to_string()))? =
-                Some(ts);
+            *self.last_event_at.lock().map_err(|_| {
+                CoreError::Internal("cloudkit last_event lock poisoned".to_string())
+            })? = Some(ts);
         }
         if appended > 0 {
             self.events_ingested.fetch_add(appended, Ordering::Relaxed);
@@ -171,9 +170,10 @@ impl StreamTransport for CloudKitTransport {
             ));
         }
         {
-            let mut guard = self.provider.lock().map_err(|_| {
-                CoreError::Internal("cloudkit provider lock poisoned".to_string())
-            })?;
+            let mut guard = self
+                .provider
+                .lock()
+                .map_err(|_| CoreError::Internal("cloudkit provider lock poisoned".to_string()))?;
             *guard = Some(provider);
         }
         let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
@@ -212,9 +212,10 @@ impl StreamTransport for CloudKitTransport {
         {
             let _ = stop_tx.send(true);
         }
-        let mut guard = self.provider.lock().map_err(|_| {
-            CoreError::Internal("cloudkit provider lock poisoned".to_string())
-        })?;
+        let mut guard = self
+            .provider
+            .lock()
+            .map_err(|_| CoreError::Internal("cloudkit provider lock poisoned".to_string()))?;
         *guard = None;
         Ok(())
     }
@@ -229,23 +230,24 @@ impl StreamTransport for CloudKitTransport {
             .and_then(|g| g.as_ref().map(|_| true))
             .unwrap_or(false);
 
-        let state = if active && has_provider && self.consecutive_failures.load(Ordering::Relaxed) == 0 {
-            TransportState::Active
-        } else if active && has_provider {
-            let reason = self
-                .last_error
-                .lock()
-                .ok()
-                .and_then(|g| g.clone())
-                .unwrap_or_else(|| "cloudkit push processing failed".to_string());
-            TransportState::Degraded { reason }
-        } else if active {
-            TransportState::Degraded {
-                reason: "no stream provider".to_string(),
-            }
-        } else {
-            TransportState::Inactive
-        };
+        let state =
+            if active && has_provider && self.consecutive_failures.load(Ordering::Relaxed) == 0 {
+                TransportState::Active
+            } else if active && has_provider {
+                let reason = self
+                    .last_error
+                    .lock()
+                    .ok()
+                    .and_then(|g| g.clone())
+                    .unwrap_or_else(|| "cloudkit push processing failed".to_string());
+                TransportState::Degraded { reason }
+            } else if active {
+                TransportState::Degraded {
+                    reason: "no stream provider".to_string(),
+                }
+            } else {
+                TransportState::Inactive
+            };
 
         let state = if self.container.trim().is_empty() || self.zone_name.trim().is_empty() {
             TransportState::Degraded {
@@ -296,11 +298,9 @@ impl StreamTransport for CloudKitTransport {
                 *self.last_event_at.lock().map_err(|_| {
                     CoreError::Internal("cloudkit last_event lock poisoned".to_string())
                 })? = None;
-                *self
-                    .change_token
-                    .lock()
-                    .map_err(|_| CoreError::Internal("cloudkit token lock poisoned".to_string()))? =
-                    None;
+                *self.change_token.lock().map_err(|_| {
+                    CoreError::Internal("cloudkit token lock poisoned".to_string())
+                })? = None;
                 return Ok(());
             }
         };
@@ -369,7 +369,12 @@ mod tests {
             Ok(0)
         }
 
-        fn append_raw_from(&self, event: RawEvent, transport: &str, record_id: &str) -> Result<Offset> {
+        fn append_raw_from(
+            &self,
+            event: RawEvent,
+            transport: &str,
+            record_id: &str,
+        ) -> Result<Offset> {
             self.raws
                 .lock()
                 .map_err(|_| CoreError::Internal("test provider lock poisoned".to_string()))?
@@ -428,7 +433,7 @@ mod tests {
             .build()
             .expect("runtime");
         let _guard = runtime.enter();
-        let _ = transport.start(provider.clone()).expect("start");
+        drop(transport.start(provider.clone()).expect("start"));
 
         let payload = serde_json::json!({
             "new_change_token": "tok-1",
@@ -450,7 +455,11 @@ mod tests {
 
         assert_eq!(transport.events_ingested.load(Ordering::Relaxed), 1);
         assert_eq!(
-            transport.change_token.lock().expect("token lock").as_deref(),
+            transport
+                .change_token
+                .lock()
+                .expect("token lock")
+                .as_deref(),
             Some("tok-1")
         );
     }
@@ -490,7 +499,7 @@ mod tests {
             .build()
             .expect("runtime");
         let _guard = runtime.enter();
-        let _ = transport.start(provider).expect("start");
+        drop(transport.start(provider).expect("start"));
 
         transport
             .on_push_notification(br#"{"records":[]}"#.to_vec())
@@ -505,7 +514,11 @@ mod tests {
             Some("tok-1")
         );
         assert_eq!(
-            transport.change_token.lock().expect("token lock").as_deref(),
+            transport
+                .change_token
+                .lock()
+                .expect("token lock")
+                .as_deref(),
             Some("tok-2")
         );
     }
@@ -519,7 +532,7 @@ mod tests {
             .build()
             .expect("runtime");
         let _guard = runtime.enter();
-        let _ = transport.start(provider).expect("start");
+        drop(transport.start(provider).expect("start"));
 
         let result = transport.on_push_notification(b"not-json".to_vec());
         assert!(result.is_err());
@@ -568,7 +581,7 @@ mod tests {
             .build()
             .expect("runtime");
         let _guard = runtime.enter();
-        let _ = transport.start(provider).expect("start");
+        drop(transport.start(provider).expect("start"));
 
         match transport.status().state {
             TransportState::Degraded { reason } => {
@@ -608,7 +621,9 @@ mod tests {
 
         runtime.block_on(async {
             let handle = transport.start(provider.clone()).expect("first start");
-            let err = transport.start(provider).expect_err("second start must fail");
+            let err = transport
+                .start(provider)
+                .expect_err("second start must fail");
             assert!(matches!(err, CoreError::InvalidInput(_)));
             transport.stop().expect("stop");
             tokio::time::timeout(Duration::from_secs(1), handle)
