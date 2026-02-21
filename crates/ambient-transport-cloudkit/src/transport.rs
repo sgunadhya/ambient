@@ -157,6 +157,11 @@ impl StreamTransport for CloudKitTransport {
     }
 
     fn start(&self, provider: Arc<dyn StreamProvider>) -> Result<tokio::task::JoinHandle<()>> {
+        if self.running.load(Ordering::Relaxed) {
+            return Err(CoreError::InvalidInput(
+                "cloudkit transport already started".to_string(),
+            ));
+        }
         {
             let mut guard = self.provider.lock().map_err(|_| {
                 CoreError::Internal("cloudkit provider lock poisoned".to_string())
@@ -576,6 +581,27 @@ mod tests {
 
         runtime.block_on(async {
             let handle = transport.start(provider).expect("start");
+            transport.stop().expect("stop");
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("join did not finish")
+                .expect("join error");
+        });
+    }
+
+    #[test]
+    fn start_twice_returns_error() {
+        let transport = CloudKitTransport::default();
+        let provider: Arc<dyn StreamProvider> = Arc::new(TestProvider::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let handle = transport.start(provider.clone()).expect("first start");
+            let err = transport.start(provider).expect_err("second start must fail");
+            assert!(matches!(err, CoreError::InvalidInput(_)));
             transport.stop().expect("stop");
             tokio::time::timeout(Duration::from_secs(1), handle)
                 .await
