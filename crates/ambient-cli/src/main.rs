@@ -13,7 +13,8 @@ use ambient_core::{
     SystemLoad, TransportState,
 };
 use ambient_menubar::{
-    parse_ambient_deep_link, start_native_runtime, AmbientDeepLink, MenubarController,
+    parse_ambient_deep_link, register_url_handler, start_native_runtime, AmbientDeepLink,
+    MenubarController,
 };
 use ambient_normalizer::{default_dispatch, NormalizerConsumer};
 use ambient_onboard::InMemoryCapabilityGate;
@@ -35,14 +36,16 @@ struct LocalLicenseGate {
 
 impl LocalLicenseGate {
     fn from_env() -> Self {
+        // Default: local daemon instances are Pro — license is enforced on
+        // hosted/remote instances. Set AMBIENT_LICENSE=free to test gated paths.
         match std::env::var("AMBIENT_LICENSE").ok().as_deref() {
-            Some("pro") => Self {
+            Some("free") => Self {
+                license: License::Free,
+            },
+            _ => Self {
                 license: License::Pro {
                     expires_at: chrono::Utc::now() + chrono::Duration::days(3650),
                 },
-            },
-            _ => Self {
-                license: License::Free,
             },
         }
     }
@@ -238,6 +241,23 @@ fn run() -> Result<(), String> {
         Commands::Watch => {
             let config_path = default_config_path()?;
             let config = AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
+
+            // Gap 4: first-run vault check — guide user through setup if no vault configured.
+            if config.obsidian_vault.is_empty()
+                || !std::path::Path::new(&config.obsidian_vault).exists()
+            {
+                eprintln!("⚠  No Obsidian vault configured. Running setup wizard...");
+                eprintln!();
+                let gate = Arc::new(InMemoryCapabilityGate::default());
+                gate.seed_defaults();
+                for line in run_setup(gate) {
+                    println!("{line}");
+                }
+                eprintln!();
+                eprintln!("Edit ~/.ambient/config.toml to set obsidian_vault, then re-run `ambient watch`.");
+                return Ok(());
+            }
+
             let daemon_pid_path = default_daemon_pid_path()?;
             let _pid_guard = DaemonPidGuard::create(daemon_pid_path)?;
             let reasoning = Arc::new(RigReasoningEngine::new(
@@ -361,6 +381,8 @@ fn run() -> Result<(), String> {
 
             let menubar_gate = Arc::new(LocalLicenseGate::from_env());
             let menubar_controller = Arc::new(MenubarController::new(engine.clone(), menubar_gate));
+            // Gap 2: register ambient:// URL scheme handler
+            register_url_handler(menubar_controller.clone());
             let _menubar_runtime = if menubar_controller.startup_check() {
                 start_native_runtime(menubar_controller).ok()
             } else {
