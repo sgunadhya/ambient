@@ -23,12 +23,9 @@ impl CloudKitChangeFetcher for NativeCloudKitFetcher {
         _push_payload: &[u8],
         _previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
-        Err(CoreError::Unsupported(Box::leak(
-            format!(
-                "native cloudkit fetch bridge not enabled for container={} zone={}",
-                self.container, self.zone_name
-            )
-            .into_boxed_str(),
-        )))
+        let _ = (&self.container, &self.zone_name);
+        Err(CoreError::Unsupported(
+            "native cloudkit fetch bridge not enabled",
+        ))
     }
 }

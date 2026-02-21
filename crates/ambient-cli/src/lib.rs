@@ -1072,6 +1072,7 @@ fn map_result<T: Serialize>(result: Result<T>) -> Response {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -1087,8 +1088,8 @@ mod tests {
     use uuid::Uuid;
 
     use crate::{
-        build_router, capability_statuses, record_query_feedback, run_doctor, run_setup,
-        submit_checkin, HttpAppState,
+        build_router, capability_statuses, record_query_feedback, run_doctor, run_setup, AmbientConfig,
+        HttpAppState, TransportRegistry, submit_checkin,
     };
 
     #[test]
@@ -1392,5 +1393,80 @@ mod tests {
             .expect("request");
         let resp = app.oneshot(req).await.expect("response");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn config_parses_cloudkit_transport_and_bridge_flags() {
+        let path = std::env::temp_dir().join(format!("ambient-config-{}.toml", Uuid::new_v4()));
+        let body = r#"
+[sources]
+obsidian_vault = "~/Documents/Obsidian"
+spotlight = true
+apple_notes = false
+healthkit = false
+calendar = false
+self_reports = true
+
+[transports]
+bonjour = false
+cloudkit = true
+google_health = false
+
+[samplers]
+context_switches = true
+active_app_titles = false
+audio_input = true
+
+[window_title_allowlist]
+apps = ["com.apple.Xcode"]
+
+[calendar]
+focus_block_patterns = ["Focus"]
+
+[checkin]
+reminder_time = ""
+
+[query]
+semantic_weight = 0.7
+feedback_weight = 0.3
+
+[cloudkit]
+container = "iCloud.test.container"
+zone_name = "TestZone"
+native_bridge = true
+
+[daemon]
+http_port = 7474
+auth_token = ""
+"#;
+        fs::write(&path, body).expect("write config");
+        let cfg = AmbientConfig::from_path(&path).expect("parse config");
+        let _ = fs::remove_file(&path);
+
+        assert!(cfg.cloudkit);
+        assert!(cfg.cloudkit_native_bridge);
+        assert_eq!(cfg.cloudkit_container, "iCloud.test.container");
+        assert_eq!(cfg.cloudkit_zone_name, "TestZone");
+        assert!(!cfg.bonjour);
+    }
+
+    #[test]
+    fn transport_registry_uses_transport_flags() {
+        let cfg = AmbientConfig {
+            bonjour: false,
+            cloudkit: true,
+            google_health: false,
+            ..AmbientConfig::default()
+        };
+        let registry = TransportRegistry::from_config(&cfg);
+        let ids = registry
+            .status_all()
+            .into_iter()
+            .map(|s| s.transport_id)
+            .collect::<Vec<_>>();
+        assert!(ids.iter().any(|id| id == "local"));
+        assert!(ids.iter().any(|id| id == "cloudkit"));
+        assert!(!ids.iter().any(|id| id == "bonjour"));
+        assert!(!ids.iter().any(|id| id == "google_health"));
     }
 }
