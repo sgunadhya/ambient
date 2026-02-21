@@ -8,6 +8,7 @@ use ambient_core::{
 use chrono::{DateTime, Utc};
 
 use crate::normalizer::{payload_from_bytes, record_to_raw_event, CloudKitPushPayload};
+use crate::native::NativeCloudKitFetcher;
 use crate::token::{decode, encode, CloudKitTokenState};
 
 pub trait CloudKitChangeFetcher: Send + Sync {
@@ -80,6 +81,14 @@ impl CloudKitTransport {
             last_error: Mutex::new(None),
             fetcher,
         }
+    }
+
+    pub fn with_native_bridge(container: String, zone_name: String) -> Self {
+        Self::with_config(
+            container.clone(),
+            zone_name.clone(),
+            Arc::new(NativeCloudKitFetcher::new(container, zone_name)),
+        )
     }
 
     fn apply_push(&self, payload: Vec<u8>) -> Result<()> {

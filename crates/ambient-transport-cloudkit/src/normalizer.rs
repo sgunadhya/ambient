@@ -25,19 +25,21 @@ pub struct CloudKitRecordEnvelope {
     pub fields: Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct CloudKitPushEnvelope {
-    #[serde(alias = "cloudkit_push", alias = "push", alias = "data")]
-    payload: CloudKitPushPayload,
-}
-
 pub fn payload_from_bytes(payload: &[u8]) -> Result<CloudKitPushPayload> {
     if let Ok(push) = serde_json::from_slice::<CloudKitPushPayload>(payload) {
         return Ok(push);
     }
-    if let Ok(envelope) = serde_json::from_slice::<CloudKitPushEnvelope>(payload) {
-        return Ok(envelope.payload);
+
+    let value: Value = serde_json::from_slice(payload)
+        .map_err(|_| CoreError::InvalidInput("invalid cloudkit push payload".to_string()))?;
+    for key in ["cloudkit_push", "push", "data", "ck"] {
+        if let Some(nested) = value.get(key) {
+            if let Ok(push) = serde_json::from_value::<CloudKitPushPayload>(nested.clone()) {
+                return Ok(push);
+            }
+        }
     }
+
     Err(CoreError::InvalidInput(
         "invalid cloudkit push payload".to_string(),
     ))
@@ -255,6 +257,14 @@ mod tests {
         let raw = br#"{"cloudkit_push":{"new_change_token":"tok-2","records":[]}}"#;
         let parsed = payload_from_bytes(raw).expect("payload parses");
         assert_eq!(parsed.new_change_token.as_deref(), Some("tok-2"));
+        assert!(parsed.records.is_empty());
+    }
+
+    #[test]
+    fn parses_ck_wrapped_payload() {
+        let raw = br#"{"ck":{"new_change_token":"tok-3","records":[]}}"#;
+        let parsed = payload_from_bytes(raw).expect("payload parses");
+        assert_eq!(parsed.new_change_token.as_deref(), Some("tok-3"));
         assert!(parsed.records.is_empty());
     }
 }

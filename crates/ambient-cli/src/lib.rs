@@ -62,11 +62,18 @@ impl TransportRegistry {
             transports.push(Arc::new(BonjourTransport::default()));
         }
         if config.cloudkit {
-            transports.push(Arc::new(CloudKitTransport::with_config(
-                config.cloudkit_container.clone(),
-                config.cloudkit_zone_name.clone(),
-                Arc::new(JsonPayloadFetcher),
-            )));
+            if config.cloudkit_native_bridge {
+                transports.push(Arc::new(CloudKitTransport::with_native_bridge(
+                    config.cloudkit_container.clone(),
+                    config.cloudkit_zone_name.clone(),
+                )));
+            } else {
+                transports.push(Arc::new(CloudKitTransport::with_config(
+                    config.cloudkit_container.clone(),
+                    config.cloudkit_zone_name.clone(),
+                    Arc::new(JsonPayloadFetcher),
+                )));
+            }
         }
         if config.google_health {
             transports.push(Arc::new(GoogleHealthTransport::default()));
@@ -239,6 +246,7 @@ pub struct AmbientConfig {
     pub feedback_weight: f32,
     pub cloudkit_container: String,
     pub cloudkit_zone_name: String,
+    pub cloudkit_native_bridge: bool,
     pub http_port: u16,
     pub auth_token: Option<String>,
 }
@@ -274,6 +282,7 @@ impl Default for AmbientConfig {
             feedback_weight: 0.3,
             cloudkit_container: "iCloud.dev.ambient.private".to_string(),
             cloudkit_zone_name: "AmbientZone".to_string(),
+            cloudkit_native_bridge: false,
             http_port: 7474,
             auth_token: None,
         }
@@ -413,6 +422,7 @@ impl Default for QueryConfig {
 struct CloudKitConfig {
     container: String,
     zone_name: String,
+    native_bridge: bool,
 }
 
 impl Default for CloudKitConfig {
@@ -421,6 +431,7 @@ impl Default for CloudKitConfig {
         Self {
             container: d.cloudkit_container,
             zone_name: d.cloudkit_zone_name,
+            native_bridge: d.cloudkit_native_bridge,
         }
     }
 }
@@ -485,6 +496,7 @@ impl AmbientConfig {
             feedback_weight: parsed.query.feedback_weight,
             cloudkit_container: parsed.cloudkit.container,
             cloudkit_zone_name: parsed.cloudkit.zone_name,
+            cloudkit_native_bridge: parsed.cloudkit.native_bridge,
             http_port: parsed.daemon.http_port,
             auth_token: parsed
                 .daemon
@@ -704,6 +716,7 @@ feedback_weight = 0.3
 [cloudkit]
 container = "iCloud.dev.ambient.private"
 zone_name = "AmbientZone"
+native_bridge = false
 
 [reasoning]
 backend = "local"
