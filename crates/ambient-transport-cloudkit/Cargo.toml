@@ -3,6 +3,10 @@ name = "ambient-transport-cloudkit"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+cloudkit-native = []
+
 [dependencies]
 ambient-core = { path = "../ambient-core" }
 chrono = { version = "0.4", features = ["serde"] }
