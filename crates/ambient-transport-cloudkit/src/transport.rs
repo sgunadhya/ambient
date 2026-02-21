@@ -55,6 +55,7 @@ pub struct CloudKitTransport {
     change_token: Mutex<Option<String>>,
     last_error: Mutex<Option<String>>,
     fetcher: Arc<dyn CloudKitChangeFetcher>,
+    stop_tx: Mutex<Option<tokio::sync::watch::Sender<bool>>>,
 }
 
 impl Default for CloudKitTransport {
@@ -92,6 +93,7 @@ impl CloudKitTransport {
             change_token: Mutex::new(None),
             last_error: Mutex::new(None),
             fetcher,
+            stop_tx: Mutex::new(None),
         }
     }
 
@@ -161,13 +163,27 @@ impl StreamTransport for CloudKitTransport {
             })?;
             *guard = Some(provider);
         }
+        let (stop_tx, mut stop_rx) = tokio::sync::watch::channel(false);
+        {
+            let mut guard = self
+                .stop_tx
+                .lock()
+                .map_err(|_| CoreError::Internal("cloudkit stop lock poisoned".to_string()))?;
+            *guard = Some(stop_tx);
+        }
         self.running.store(true, Ordering::Relaxed);
 
         let handle = tokio::runtime::Handle::try_current()
             .map_err(|e| CoreError::Internal(format!("tokio runtime unavailable: {e}")))?
             .spawn(async move {
                 loop {
-                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    if *stop_rx.borrow() {
+                        break;
+                    }
+                    let _ = tokio::time::timeout(Duration::from_secs(60), stop_rx.changed()).await;
+                    if *stop_rx.borrow() {
+                        break;
+                    }
                 }
             });
         Ok(handle)
@@ -175,6 +191,14 @@ impl StreamTransport for CloudKitTransport {
 
     fn stop(&self) -> Result<()> {
         self.running.store(false, Ordering::Relaxed);
+        if let Some(stop_tx) = self
+            .stop_tx
+            .lock()
+            .map_err(|_| CoreError::Internal("cloudkit stop lock poisoned".to_string()))?
+            .take()
+        {
+            let _ = stop_tx.send(true);
+        }
         let mut guard = self.provider.lock().map_err(|_| {
             CoreError::Internal("cloudkit provider lock poisoned".to_string())
         })?;
@@ -539,5 +563,24 @@ mod tests {
             }
             other => panic!("expected degraded status, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stop_signals_background_task_exit() {
+        let transport = CloudKitTransport::default();
+        let provider: Arc<dyn StreamProvider> = Arc::new(TestProvider::default());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("runtime");
+
+        runtime.block_on(async {
+            let handle = transport.start(provider).expect("start");
+            transport.stop().expect("stop");
+            tokio::time::timeout(Duration::from_secs(1), handle)
+                .await
+                .expect("join did not finish")
+                .expect("join error");
+        });
     }
 }
