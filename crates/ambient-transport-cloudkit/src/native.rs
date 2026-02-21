@@ -1,8 +1,7 @@
-use ambient_core::{CoreError, Result};
+use ambient_core::Result;
 
+use crate::apple_bridge::{build_fetch_request, fetch_changes_native};
 use crate::normalizer::CloudKitPushPayload;
-#[cfg(all(target_os = "macos", feature = "cloudkit-native"))]
-use crate::normalizer::payload_from_bytes;
 use crate::transport::CloudKitChangeFetcher;
 
 pub struct NativeCloudKitFetcher {
@@ -44,28 +43,27 @@ impl NativeCloudKitFetcher {
         push_payload: &[u8],
         previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
-        let _ = (&self.container, &self.zone_name, previous_token);
-        payload_from_bytes(push_payload).map_err(|_| {
-            CoreError::Unsupported("native cloudkit bridge enabled, fetch op wiring pending")
-        })
+        let request =
+            build_fetch_request(push_payload, &self.container, &self.zone_name, previous_token)?;
+        fetch_changes_native(request)
     }
 
     #[cfg(not(all(target_os = "macos", feature = "cloudkit-native")))]
     fn fetch_changes_native(
         &self,
-        _push_payload: &[u8],
-        _previous_token: Option<&str>,
+        push_payload: &[u8],
+        previous_token: Option<&str>,
     ) -> Result<CloudKitPushPayload> {
-        let _ = (&self.container, &self.zone_name);
-        Err(CoreError::Unsupported(
-            "native cloudkit bridge unavailable in this build",
-        ))
+        let request =
+            build_fetch_request(push_payload, &self.container, &self.zone_name, previous_token)?;
+        fetch_changes_native(request)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::NativeCloudKitFetcher;
+    use crate::apple_bridge::build_fetch_request;
     use crate::transport::CloudKitChangeFetcher;
 
     #[test]
@@ -78,5 +76,18 @@ mod tests {
             fetcher.is_available(),
             cfg!(all(target_os = "macos", feature = "cloudkit-native"))
         );
+    }
+
+    #[test]
+    fn build_fetch_request_marks_structured_payload() {
+        let req = build_fetch_request(
+            br#"{"cloudkit_push":{"records":[]}}"#,
+            "iCloud.dev.ambient.private",
+            "AmbientZone",
+            Some("tok-1"),
+        )
+        .expect("request");
+        assert!(req.push_is_structured);
+        assert_eq!(req.previous_token.as_deref(), Some("tok-1"));
     }
 }

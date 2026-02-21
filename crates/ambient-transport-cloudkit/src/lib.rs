@@ -1,3 +1,4 @@
+mod apple_bridge;
 mod normalizer;
 mod native;
 mod record_types;
