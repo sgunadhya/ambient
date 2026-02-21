@@ -15,7 +15,10 @@ pub struct AmbientQueryEngine {
 }
 
 impl AmbientQueryEngine {
-    pub fn new(store: Arc<dyn KnowledgeStore>, reasoning: Option<Arc<dyn ReasoningEngine>>) -> Self {
+    pub fn new(
+        store: Arc<dyn KnowledgeStore>,
+        reasoning: Option<Arc<dyn ReasoningEngine>>,
+    ) -> Self {
         Self {
             store,
             reasoning,
@@ -27,6 +30,11 @@ impl AmbientQueryEngine {
 
     pub fn with_capability_gate(mut self, gate: Arc<dyn CapabilityGate>) -> Self {
         self.gate = Some(gate);
+        self
+    }
+
+    pub fn with_reasoning(mut self, reasoning: Arc<dyn ReasoningEngine>) -> Self {
+        self.reasoning = Some(reasoning);
         self
     }
 
@@ -43,7 +51,10 @@ impl AmbientQueryEngine {
     }
 
     fn semantic_allowed(&self) -> bool {
-        matches!(self.semantic_capability_status(), None | Some(CapabilityStatus::Ready))
+        matches!(
+            self.semantic_capability_status(),
+            None | Some(CapabilityStatus::Ready)
+        )
     }
 
     fn fallback_query(&self, req: &QueryRequest) -> Result<Vec<QueryResult>> {
@@ -94,9 +105,10 @@ impl AmbientQueryEngine {
             return Ok(None);
         };
 
+        let vec = reasoning.embed(&req.text).unwrap_or_default();
         let units = self
             .store
-            .search_semantic(&req.text, req.k)
+            .search_semantic(&vec, req.k)
             .or_else(|_| self.store.search_fulltext(&req.text))?;
 
         let response = reasoning.answer(question, &units)?;
@@ -106,10 +118,15 @@ impl AmbientQueryEngine {
 
 impl QueryEngine for AmbientQueryEngine {
     fn query(&self, req: QueryRequest) -> Result<Vec<QueryResult>> {
-        let units = if self.semantic_allowed() {
-            self.store
-                .search_semantic(&req.text, req.k)
-                .or_else(|_| self.store.search_fulltext(&req.text))
+        let units = if self.semantic_allowed() && self.reasoning.is_some() {
+            let reasoning = self.reasoning.as_ref().unwrap();
+            match reasoning.embed(&req.text) {
+                Ok(vec) => self
+                    .store
+                    .search_semantic(&vec, req.k)
+                    .or_else(|_| self.store.search_fulltext(&req.text)),
+                Err(_) => self.store.search_fulltext(&req.text),
+            }
         } else {
             self.store.search_fulltext(&req.text)
         };
@@ -166,17 +183,21 @@ impl QueryEngine for AmbientQueryEngine {
     }
 }
 
-pub fn build_runtime_components() -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
-    build_runtime_components_with_weights(0.7, 0.3)
+pub fn build_runtime_components(
+    reasoning: Option<Arc<dyn ReasoningEngine>>,
+) -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
+    build_runtime_components_with_weights(0.7, 0.3, reasoning)
 }
 
 pub fn build_runtime_components_with_weights(
     semantic_weight: f32,
     feedback_weight: f32,
+    reasoning: Option<Arc<dyn ReasoningEngine>>,
 ) -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
     let store: Arc<dyn KnowledgeStore> = Arc::new(CozoStore::new()?);
     let engine: Arc<dyn QueryEngine> = Arc::new(
-        AmbientQueryEngine::new(store.clone(), None).with_weights(semantic_weight, feedback_weight),
+        AmbientQueryEngine::new(store.clone(), reasoning)
+            .with_weights(semantic_weight, feedback_weight),
     );
     Ok((engine, store))
 }

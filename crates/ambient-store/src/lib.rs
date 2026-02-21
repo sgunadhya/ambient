@@ -4,8 +4,8 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use ambient_core::{
-    derive_cognitive_state, CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore,
-    KnowledgeUnit, PulseEvent, PulseSignal, Result,
+    derive_cognitive_state, CognitiveState, CoreError, FeedbackEvent, FeedbackSignal,
+    KnowledgeStore, KnowledgeUnit, PulseEvent, PulseSignal, Result,
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
@@ -68,6 +68,7 @@ impl CozoStore {
     title: String,
     content: String,
     hash: String,
+    embedding: <F32; 768>?,
     observed_at: Float
 }
 :create links {
@@ -114,6 +115,32 @@ impl CozoStore {
         let _ = self
             .cozo
             .run_script(schema, BTreeMap::new(), ScriptMutability::Mutable);
+
+        // HNSW Vector Index setup
+        let hnsw_schema = r#"
+::hnsw create notes:embedding_idx {
+    dim: 768,
+    dtype: F32,
+    fields: [embedding],
+    distance: Cosine,
+    ef_construction: 200,
+    m: 16
+}
+"#;
+        let _ = self
+            .cozo
+            .run_script(hnsw_schema, BTreeMap::new(), ScriptMutability::Mutable);
+
+        // FTS Setup
+        let fts_schema = r#"
+::fts create notes:fts {
+    fields: [title, content],
+    filters: {language: English}
+}
+"#;
+        let _ = self
+            .cozo
+            .run_script(fts_schema, BTreeMap::new(), ScriptMutability::Mutable);
     }
 
     fn cozo_put_note(&self, unit: &KnowledgeUnit) {
@@ -129,16 +156,21 @@ impl CozoStore {
             "hash".to_string(),
             DataValue::from(hash_to_string(&unit.content_hash)),
         );
+        let embedding_val = match &unit.embedding {
+            Some(vec) => DataValue::List(vec.iter().map(|f| DataValue::from(*f as f64)).collect()),
+            None => DataValue::Null,
+        };
+        params.insert("embedding".to_string(), embedding_val);
         params.insert(
             "observed_at".to_string(),
             DataValue::from(unit.observed_at.timestamp_millis() as f64),
         );
 
         let script = r#"
-?[id, source, title, content, hash, observed_at] <- [[
-    $id, $source, $title, $content, $hash, $observed_at
+?[id, source, title, content, hash, embedding, observed_at] <- [[
+    $id, $source, $title, $content, $hash, $embedding, $observed_at
 ]]
-:put notes { id => source, title, content, hash, observed_at }
+:put notes { id => source, title, content, hash, embedding, observed_at }
 "#;
         let _ = self
             .cozo
@@ -149,7 +181,10 @@ impl CozoStore {
         let mut params = BTreeMap::new();
         params.insert("from_id".to_string(), DataValue::from(from_id.to_string()));
         params.insert("to_id".to_string(), DataValue::from(to_id.to_string()));
-        params.insert("link_type".to_string(), DataValue::from("wikilink".to_string()));
+        params.insert(
+            "link_type".to_string(),
+            DataValue::from("wikilink".to_string()),
+        );
 
         let script = r#"
 ?[from_id, to_id, link_type] <- [[ $from_id, $to_id, $link_type ]]
@@ -174,8 +209,14 @@ impl CozoStore {
             DataValue::from(unit.observed_at.timestamp_millis() as f64),
         );
         params.insert("window_secs".to_string(), DataValue::from(window_secs));
-        params.insert("was_in_flow".to_string(), DataValue::from(state.was_in_flow));
-        params.insert("was_on_call".to_string(), DataValue::from(state.was_on_call));
+        params.insert(
+            "was_in_flow".to_string(),
+            DataValue::from(state.was_in_flow),
+        );
+        params.insert(
+            "was_on_call".to_string(),
+            DataValue::from(state.was_on_call),
+        );
         params.insert(
             "dominant_app".to_string(),
             state
@@ -188,8 +229,14 @@ impl CozoStore {
             "time_of_day".to_string(),
             DataValue::from(state.time_of_day.unwrap_or(0) as i64),
         );
-        params.insert("context_switch_rate".to_string(), DataValue::from(context_switch_rate));
-        params.insert("was_in_meeting".to_string(), DataValue::from(state.was_in_meeting));
+        params.insert(
+            "context_switch_rate".to_string(),
+            DataValue::from(context_switch_rate),
+        );
+        params.insert(
+            "was_in_meeting".to_string(),
+            DataValue::from(state.was_in_meeting),
+        );
         params.insert(
             "was_in_focus_block".to_string(),
             DataValue::from(state.was_in_focus_block),
@@ -255,7 +302,10 @@ impl CozoStore {
                 Some(format!("{action:?}")),
                 None,
             ),
-            FeedbackSignal::QueryResultDismissed { query_text, unit_id } => (
+            FeedbackSignal::QueryResultDismissed {
+                query_text,
+                unit_id,
+            } => (
                 "query_result_dismissed".to_string(),
                 Some(unit_id.to_string()),
                 Some(query_text.clone()),
@@ -395,7 +445,10 @@ impl CozoStore {
                     labels.insert("minutes_until_next".to_string(), minutes.to_string());
                 }
                 if let Some(minutes) = current_event_duration_minutes {
-                    labels.insert("current_event_duration_minutes".to_string(), minutes.to_string());
+                    labels.insert(
+                        "current_event_duration_minutes".to_string(),
+                        minutes.to_string(),
+                    );
                 }
                 tsink::Record {
                     metric: METRIC_CALENDAR_CONTEXT.to_string(),
@@ -581,22 +634,27 @@ impl KnowledgeStore for CozoStore {
         let pulse = self.pulse_window(from, to).unwrap_or_default();
         let state = derive_cognitive_state(unit.observed_at, &pulse);
         let avg_switch = {
-            let (sum, count) = pulse.iter().fold((0.0f64, 0usize), |acc, event| {
-                match event.signal {
-                    PulseSignal::ContextSwitchRate { switches_per_minute } => {
-                        (acc.0 + switches_per_minute as f64, acc.1 + 1)
-                    }
-                    PulseSignal::ActiveApp { .. }
-                    | PulseSignal::AudioInputActive { .. }
-                    | PulseSignal::TimeContext { .. }
-                    | PulseSignal::CalendarContext { .. }
-                    | PulseSignal::EnergyLevel { .. }
-                    | PulseSignal::MoodLevel { .. }
-                    | PulseSignal::HRVScore { .. }
-                    | PulseSignal::SleepQuality { .. } => acc,
-                }
-            });
-            if count == 0 { 0.0 } else { sum / count as f64 }
+            let (sum, count) =
+                pulse
+                    .iter()
+                    .fold((0.0f64, 0usize), |acc, event| match event.signal {
+                        PulseSignal::ContextSwitchRate {
+                            switches_per_minute,
+                        } => (acc.0 + switches_per_minute as f64, acc.1 + 1),
+                        PulseSignal::ActiveApp { .. }
+                        | PulseSignal::AudioInputActive { .. }
+                        | PulseSignal::TimeContext { .. }
+                        | PulseSignal::CalendarContext { .. }
+                        | PulseSignal::EnergyLevel { .. }
+                        | PulseSignal::MoodLevel { .. }
+                        | PulseSignal::HRVScore { .. }
+                        | PulseSignal::SleepQuality { .. } => acc,
+                    });
+            if count == 0 {
+                0.0
+            } else {
+                sum / count as f64
+            }
         };
 
         // ── Update in-memory caches ───────────────────────────────────────────
@@ -623,33 +681,45 @@ impl KnowledgeStore for CozoStore {
         Ok(())
     }
 
-    fn search_semantic(&self, query: &str, k: usize) -> Result<Vec<KnowledgeUnit>> {
-        let units: Vec<KnowledgeUnit> = self
-            .units
-            .lock()
-            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-            .values()
-            .cloned()
-            .collect();
+    fn search_semantic(&self, query_vec: &[f32], k: usize) -> Result<Vec<KnowledgeUnit>> {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "vec".to_string(),
+            DataValue::List(
+                query_vec
+                    .iter()
+                    .map(|f| DataValue::from(*f as f64))
+                    .collect(),
+            ),
+        );
+        params.insert("k".to_string(), DataValue::from(k as i64));
 
-        if units.iter().any(|u| u.embedding.is_some()) {
-            let mut ranked = units;
-            ranked.sort_by_key(|u| std::cmp::Reverse(u.embedding.as_ref().map_or(0usize, |v| v.len())));
-            return Ok(ranked.into_iter().take(k).collect());
-        }
-
-        let mut fallback: Vec<KnowledgeUnit> = self.search_fulltext(query)?.into_iter().take(k).collect();
-        if fallback.is_empty() {
-            fallback = self
+        let script = r#"
+?[id, dist] :=
+    ~notes:embedding_idx{ id | query: $vec, k: $k, ef: 50, bind_distance: dist }
+:order dist
+:limit $k
+"#;
+        let mut results = Vec::new();
+        if let Ok(result) = self
+            .cozo
+            .run_script(script, params, cozo::ScriptMutability::Immutable)
+        {
+            let units_cache = self
                 .units
                 .lock()
-                .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-                .values()
-                .take(k)
-                .cloned()
-                .collect();
+                .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?;
+            for row in result.rows {
+                if let Some(cozo::DataValue::Str(id_str)) = row.first() {
+                    if let Ok(id) = uuid::Uuid::parse_str(id_str.as_ref()) {
+                        if let Some(unit) = units_cache.get(&id) {
+                            results.push(unit.clone());
+                        }
+                    }
+                }
+            }
         }
-        Ok(fallback)
+        Ok(results)
     }
 
     fn search_fulltext(&self, query: &str) -> Result<Vec<KnowledgeUnit>> {

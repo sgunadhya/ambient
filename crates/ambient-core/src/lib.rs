@@ -337,7 +337,7 @@ pub trait Normalizer: Send + Sync {
 
 pub trait KnowledgeStore: Send + Sync {
     fn upsert(&self, unit: KnowledgeUnit) -> Result<()>;
-    fn search_semantic(&self, query: &str, k: usize) -> Result<Vec<KnowledgeUnit>>;
+    fn search_semantic(&self, query_vec: &[f32], k: usize) -> Result<Vec<KnowledgeUnit>>;
     fn search_fulltext(&self, query: &str) -> Result<Vec<KnowledgeUnit>>;
     fn related(&self, id: Uuid, depth: usize) -> Result<Vec<KnowledgeUnit>>;
     fn get_by_id(&self, id: Uuid) -> Result<Option<KnowledgeUnit>>;
@@ -643,7 +643,11 @@ pub mod mocks {
             Ok(())
         }
 
-        fn search_semantic(&self, _query: &str, k: usize) -> Result<Vec<crate::KnowledgeUnit>> {
+        fn search_semantic(
+            &self,
+            _query_vec: &[f32],
+            k: usize,
+        ) -> Result<Vec<crate::KnowledgeUnit>> {
             if let Ok(mut calls) = self.calls.lock() {
                 calls.push(KnowledgeStoreCall {
                     method: "search_semantic".to_string(),

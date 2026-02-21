@@ -240,9 +240,17 @@ fn run() -> Result<(), String> {
             let config = AmbientConfig::ensure_default(&config_path).map_err(|e| e.to_string())?;
             let daemon_pid_path = default_daemon_pid_path()?;
             let _pid_guard = DaemonPidGuard::create(daemon_pid_path)?;
+            let reasoning = Arc::new(RigReasoningEngine::new(
+                ambient_core::ReasoningBackend::Local {
+                    ollama_base_url: "http://localhost:11434".to_string(),
+                },
+            ));
+            reasoning.start_ollama_probe();
+
             let (engine, store) = build_runtime_components_with_weights(
                 config.semantic_weight,
                 config.feedback_weight,
+                Some(reasoning.clone()),
             )
             .map_err(|e| e.to_string())?;
 
@@ -250,12 +258,6 @@ fn run() -> Result<(), String> {
             let spotlight_exporter = Arc::new(CoreSpotlightExporter::default());
             let stream_provider = open_default_stream_provider().map_err(|e| e.to_string())?;
 
-            let reasoning = Arc::new(RigReasoningEngine::new(
-                ambient_core::ReasoningBackend::Local {
-                    ollama_base_url: "http://localhost:11434".to_string(),
-                },
-            ));
-            reasoning.start_ollama_probe();
             let embedding_queue = Arc::new(EmbeddingQueue::new(store.clone(), reasoning.clone()));
 
             let broadcaster = Arc::new(LoadBroadcaster::default());
