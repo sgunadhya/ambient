@@ -109,7 +109,8 @@ dependencies = [
  "ambient-normalizer",
  "ambient-query",
  "ambient-store",
- "ambient-watcher",
+ "ambient-stream",
+ "ambient-transport-local",
  "axum",
  "chrono",
  "serde_json",
@@ -272,7 +273,6 @@ version = "0.1.0"
 dependencies = [
  "ambient-core",
  "ambient-spotlight",
- "ambient-watcher",
  "chrono",
  "core-foundation 0.10.1",
  "notify",
@@ -292,17 +292,6 @@ dependencies = [
  "serde",
  "serde_json",
  "uuid",
-]
-
-[[package]]
-name = "ambient-watcher"
-version = "0.1.0"
-dependencies = [
- "ambient-core",
- "chrono",
- "core-foundation 0.10.1",
- "notify",
- "objc2",
 ]
 
 [[package]]

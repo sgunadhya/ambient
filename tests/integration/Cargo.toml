@@ -5,11 +5,12 @@ edition = "2021"
 
 [dependencies]
 ambient-core = { path = "../../crates/ambient-core" }
-ambient-watcher = { path = "../../crates/ambient-watcher" }
 ambient-normalizer = { path = "../../crates/ambient-normalizer" }
 ambient-store = { path = "../../crates/ambient-store" }
 ambient-query = { path = "../../crates/ambient-query" }
 ambient-cli = { path = "../../crates/ambient-cli" }
+ambient-stream = { path = "../../crates/ambient-stream" }
+ambient-transport-local = { path = "../../crates/ambient-transport-local" }
 axum = "0.7"
 chrono = "0.4"
 serde_json = "1"
