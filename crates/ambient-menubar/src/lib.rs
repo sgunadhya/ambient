@@ -315,6 +315,55 @@ mod macos_runtime {
         let _ = install;
     }
 
+    static URL_CONTROLLER: std::sync::OnceLock<Arc<MenubarController>> = std::sync::OnceLock::new();
+
+    fn create_url_handler_class() -> &'static objc2::runtime::AnyClass {
+        static CLASS: std::sync::OnceLock<&'static objc2::runtime::AnyClass> =
+            std::sync::OnceLock::new();
+        *CLASS.get_or_init(|| {
+            let mut builder =
+                objc2::runtime::ClassBuilder::new(c"AmbientUrlHandler", class!(NSObject)).unwrap();
+
+            extern "C" fn handle_event_with_reply(
+                _this: &AnyObject,
+                _cmd: objc2::runtime::Sel,
+                event: *mut AnyObject,
+                _reply: *mut AnyObject,
+            ) {
+                unsafe {
+                    // keyDirectObject = '----' = 0x2d2d2d2d
+                    let direct: *mut AnyObject =
+                        msg_send![event, paramDescriptorForKeyword: 0x2d2d2d2d_u32];
+                    if direct.is_null() {
+                        return;
+                    }
+                    let url_str: *mut AnyObject = msg_send![direct, stringValue];
+                    if url_str.is_null() {
+                        return;
+                    }
+                    let c_string: *const std::ffi::c_char = msg_send![url_str, UTF8String];
+                    if c_string.is_null() {
+                        return;
+                    }
+                    let c_str = std::ffi::CStr::from_ptr(c_string);
+                    if let Ok(url) = c_str.to_str() {
+                        if let Some(controller) = URL_CONTROLLER.get() {
+                            let _ = controller.open_deep_link(url);
+                        }
+                    }
+                }
+            }
+
+            unsafe {
+                builder.add_method(
+                    objc2::sel!(handleEvent:withReplyEvent:),
+                    handle_event_with_reply as extern "C" fn(_, _, _, _),
+                );
+            }
+            builder.register()
+        })
+    }
+
     /// Install an Apple Event handler for the `ambient://` URL scheme.
     ///
     /// The OS delivers `kInternetEventClass / kAEGetURL` events when the user
@@ -325,34 +374,38 @@ mod macos_runtime {
     /// Implementation uses raw Apple Event Manager C APIs via `objc2`-style
     /// `extern "C"` declarations — no additional crate dependency beyond
     /// `core-foundation` which is already present.
-    pub fn register_url_handler(_controller: Arc<MenubarController>) {
+    pub fn register_url_handler(controller: Arc<MenubarController>) {
+        if URL_CONTROLLER.get().is_none() {
+            let _ = URL_CONTROLLER.set(controller);
+        }
+
         thread::Builder::new()
             .name("ambient-url-handler".to_string())
             .spawn(move || {
                 // Install handler via NSAppleEventManager (Objective-C).
                 // kInternetEventClass = 0x4755524c ('GURL')
                 // kAEGetURL           = 0x4755524c ('GURL') — same value per AERegistry.h
-                // We use the keyAEDesktopObject constant for the direct object.
                 autoreleasepool(|_| {
                     let manager: *mut AnyObject =
                         unsafe { msg_send![class!(NSAppleEventManager), sharedAppleEventManager] };
                     if !manager.is_null() {
-                        // We can't easily pass a Rust closure through ObjC, so we
-                        // register via a global trampoline approach: store the controller
-                        // in thread_local and use a raw function pointer block.
-                        // For now, log that we attempted registration; the CFRunLoop
-                        // below keeps this thread alive so future events arrive.
-                        // A full impl would use `NSAppleEventManager
-                        //   setEventHandler:andSelector:forEventClass:andEventID:`.
-                        // This skeleton is correct structure; full AE implementation
-                        // requires either `block2` crate or a thin ObjC shim.
-                        let _ = manager;
+                        let cls = create_url_handler_class();
+                        let handler_obj: *mut AnyObject = unsafe { msg_send![cls, new] };
+
+                        // - (void)setEventHandler:(id)handler andSelector:(SEL)handleEventSelector forEventClass:(AEEventClass)eventClass andEventID:(AEEventID)eventID;
+                        unsafe {
+                            let _: () = msg_send![
+                                manager,
+                                setEventHandler: handler_obj,
+                                andSelector: objc2::sel!(handleEvent:withReplyEvent:),
+                                forEventClass: 0x4755524c_u32,
+                                andEventID: 0x4755524c_u32
+                            ];
+                        }
                     }
                 });
 
                 // Run the thread's CFRunLoop so Apple Events can be delivered.
-                // In a full implementation the event handler set above receives events
-                // on this runloop.
                 CFRunLoop::run_current();
             })
             .ok();

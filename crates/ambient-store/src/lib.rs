@@ -60,6 +60,37 @@ impl CozoStore {
         Ok(store)
     }
 
+    pub fn new_for_test() -> Result<Self> {
+        let temp_dir = std::env::temp_dir().join(format!("ambient_test_{}", Uuid::new_v4()));
+        let cozo_path = temp_dir.join("cozo.sqlite");
+        let pulse_path = temp_dir.join("pulse");
+
+        std::fs::create_dir_all(&temp_dir).unwrap();
+
+        let cozo = DbInstance::new("sqlite", cozo_path.to_str().unwrap(), "")
+            .map_err(|e| CoreError::Internal(format!("failed to initialize cozo: {e}")))?;
+
+        let pulse_storage = tsink::StorageBuilder::new()
+            .with_data_path(pulse_path.to_str().unwrap())
+            .with_partition_duration(Duration::from_secs(3600))
+            .with_retention(Duration::from_secs(90 * 24 * 3600))
+            .with_wal_sync_mode(tsink::WalSyncMode::Periodic(Duration::from_secs(1)))
+            .build()
+            .map_err(|e| CoreError::Internal(format!("failed to initialize tsink: {e}")))?;
+
+        let store = Self {
+            cozo,
+            units: Mutex::new(HashMap::new()),
+            hash_index: Mutex::new(HashMap::new()),
+            links: Mutex::new(HashMap::new()),
+            snapshots: Mutex::new(HashMap::new()),
+            feedback: Mutex::new(Vec::new()),
+            pulse_storage,
+        };
+        store.init_cozo_schema();
+        Ok(store)
+    }
+
     fn init_cozo_schema(&self) {
         let schema = r#"
 :create notes {
@@ -1071,7 +1102,7 @@ mod tests {
 
     #[test]
     fn pulse_window_returns_sorted_events() {
-        let store = CozoStore::new().expect("store should build");
+        let store = CozoStore::new_for_test().expect("store should build");
         let base = Utc::now();
 
         store
@@ -1110,7 +1141,7 @@ mod tests {
 
     #[test]
     fn unit_with_context_derives_cognitive_state() {
-        let store = CozoStore::new().expect("store should build");
+        let store = CozoStore::new_for_test().expect("store should build");
         let observed_at = Utc::now();
         let id = Uuid::new_v4();
 

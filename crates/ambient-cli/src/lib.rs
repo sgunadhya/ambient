@@ -748,6 +748,12 @@ pub struct FeedbackRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PatternFeedbackRequest {
+    pub pattern_id: Uuid,
+    pub useful: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HealthResponse {
     pub status: String,
     pub units: usize,
@@ -791,6 +797,9 @@ pub fn build_router(state: HttpAppState) -> Router {
         .route("/health", get(http_health))
         .route("/checkin", post(http_checkin))
         .route("/feedback", post(http_feedback))
+        .route("/pattern-feedback", post(http_pattern_feedback))
+        .route("/report", get(http_report))
+        .route("/export", get(http_export))
         .route("/transport/:id/push", post(http_transport_push))
         .route("/open/unit/:id", post(http_open_unit))
         .route("/open/focus", get(http_get_focus))
@@ -970,6 +979,70 @@ async fn http_feedback(
         req.useful,
         req.ms_to_action,
     ))
+}
+
+async fn http_pattern_feedback(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<PatternFeedbackRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    let signal = if req.useful {
+        ambient_core::FeedbackSignal::PatternMarkedUseful {
+            pattern_id: req.pattern_id,
+        }
+    } else {
+        ambient_core::FeedbackSignal::PatternMarkedNoise {
+            pattern_id: req.pattern_id,
+        }
+    };
+    let event = ambient_core::FeedbackEvent {
+        id: uuid::Uuid::new_v4(),
+        timestamp: chrono::Utc::now(),
+        signal,
+    };
+    map_result(state.store.record_feedback(event))
+}
+
+async fn http_report(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+
+    let home = match std::env::var("HOME") {
+        Ok(h) => h,
+        Err(_) => {
+            return (StatusCode::INTERNAL_SERVER_ERROR, "failed to resolve HOME").into_response()
+        }
+    };
+
+    let path = std::path::PathBuf::from(home)
+        .join(".ambient")
+        .join("reports")
+        .join("weekly.html");
+
+    if let Ok(content) = std::fs::read_to_string(&path) {
+        axum::response::Html(content).into_response()
+    } else {
+        let msg: &'static str = "Report not found or not generated yet";
+        (StatusCode::NOT_FOUND, msg).into_response()
+    }
+}
+
+async fn http_export(State(state): State<HttpAppState>, headers: HeaderMap) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    match state.store.search_fulltext("") {
+        Ok(units) => Json(units).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Export error: {e}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn http_open_unit(
