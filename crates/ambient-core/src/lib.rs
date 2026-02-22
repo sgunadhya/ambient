@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -9,7 +9,7 @@ use chrono::{DateTime, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use uuid::Uuid;
+pub use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
@@ -127,7 +127,6 @@ pub struct KnowledgeUnit {
     pub content: String,
     pub title: Option<String>,
     pub metadata: HashMap<String, Value>,
-    pub embedding: Option<Vec<f32>>,
     pub observed_at: DateTime<Utc>,
     pub content_hash: [u8; 32],
 }
@@ -242,6 +241,19 @@ pub enum FeedbackSignal {
     },
     PatternMarkedNoise {
         pattern_id: Uuid,
+    },
+    /// Emitted when the user acts on an Oracle (`/ask`) result.
+    /// This is the highest-quality learning signal — the Noticer
+    /// weights these events 3x in cluster discovery.
+    OracleResultActedOn {
+        query_text: String,
+        unit_id: Uuid,
+        action: ResultAction,
+        ms_to_action: u32,
+        /// L1 lens vector active at the moment of the Oracle call.
+        /// Stored so the Noticer can associate the success with the
+        /// semantic context, not just the query string.
+        active_lens_snapshot: Option<Vec<f32>>,
     },
 }
 
@@ -375,10 +387,22 @@ pub trait KnowledgeStore: Send + Sync {
     fn record_feedback(&self, event: FeedbackEvent) -> Result<()>;
     fn feedback_score(&self, unit_id: Uuid) -> Result<f32>;
     fn pattern_feedback(&self, pattern_id: Uuid) -> Result<Option<String>>;
+
+    /// Write a lens vector for a unit into the disjoint lens_map store.
+    /// `lens_id` is one of: "l1_semantic", "l2_technical", "l5_social".
+    fn upsert_lens(&self, unit_id: Uuid, lens_id: &str, vec: Vec<f32>) -> Result<()>;
+
+    /// Retrieve the top-k units by cosine similarity within a specific lens.
+    fn search_lens(&self, lens_id: &str, query_vec: &[f32], k: usize)
+        -> Result<Vec<KnowledgeUnit>>;
+
+    /// Re-calculate and update the temporal profiles for units based on pulse history.
+    fn calculate_temporal_profile(&self, unit_id: Uuid) -> Result<()>;
 }
 
 pub trait ReasoningEngine: Send + Sync {
     fn embed(&self, text: &str) -> Result<Vec<f32>>;
+    fn embed_with_model(&self, text: &str, model: &str) -> Result<Vec<f32>>;
     fn answer(&self, question: &str, context: &[KnowledgeUnit]) -> Result<String>;
 }
 
@@ -457,6 +481,7 @@ pub fn derive_cognitive_state(observed_at: DateTime<Utc>, pulse: &[PulseEvent]) 
 
 pub trait QueryEngine: Send + Sync {
     fn query(&self, req: QueryRequest) -> Result<Vec<QueryResult>>;
+    fn answer(&self, question: &str, req: QueryRequest) -> Result<Option<String>>;
 }
 
 pub trait StreamProvider: Send + Sync {
@@ -575,6 +600,47 @@ pub enum GatedCapability {
 pub trait CapabilityGate: Send + Sync {
     fn status(&self, capability: GatedCapability) -> CapabilityStatus;
     fn mark_ready(&self, capability: GatedCapability);
+}
+
+pub struct KnowledgeConsumer {
+    provider: Arc<dyn StreamProvider>,
+    consumer_id: ConsumerId,
+    offset: Mutex<Offset>,
+}
+
+impl KnowledgeConsumer {
+    pub fn new(provider: Arc<dyn StreamProvider>, consumer_id: ConsumerId) -> Result<Self> {
+        let offset = provider.last_committed(&consumer_id)?.unwrap_or(0);
+        Ok(Self {
+            provider,
+            consumer_id,
+            offset: Mutex::new(offset),
+        })
+    }
+
+    pub fn provider(&self) -> Arc<dyn StreamProvider> {
+        self.provider.clone()
+    }
+
+    pub fn poll<F>(&self, limit: usize, mut f: F) -> Result<()>
+    where
+        F: FnMut(Offset, EventLogEntry) -> Result<()>,
+    {
+        let mut offset_guard = self.offset.lock().map_err(|_| {
+            CoreError::Internal("knowledge consumer offset lock poisoned".to_string())
+        })?;
+        let batch = self
+            .provider
+            .read(&self.consumer_id, *offset_guard, limit)?;
+
+        for (next_offset, entry) in batch {
+            f(next_offset, entry)?;
+            self.provider.commit(&self.consumer_id, next_offset)?;
+            *offset_guard = next_offset;
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(any(test, feature = "test-mocks"))]
@@ -799,6 +865,23 @@ pub mod mocks {
             }
             Ok(None)
         }
+
+        fn upsert_lens(&self, _unit_id: Uuid, _lens_id: &str, _vec: Vec<f32>) -> Result<()> {
+            Ok(())
+        }
+
+        fn search_lens(
+            &self,
+            _lens_id: &str,
+            _query_vec: &[f32],
+            k: usize,
+        ) -> Result<Vec<crate::KnowledgeUnit>> {
+            self.search_semantic(_query_vec, k)
+        }
+
+        fn calculate_temporal_profile(&self, _unit_id: Uuid) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -819,6 +902,10 @@ pub mod mocks {
                 });
             }
             Ok(vec![text.len() as f32])
+        }
+
+        fn embed_with_model(&self, text: &str, _model: &str) -> Result<Vec<f32>> {
+            self.embed(text)
         }
 
         fn answer(&self, question: &str, _context: &[crate::KnowledgeUnit]) -> Result<String> {
@@ -854,6 +941,15 @@ pub mod mocks {
                 .lock()
                 .map_err(|_| CoreError::Internal("results lock poisoned".to_string()))?
                 .clone())
+        }
+
+        fn answer(&self, _question: &str, _req: QueryRequest) -> Result<Option<String>> {
+            if let Ok(mut calls) = self.calls.lock() {
+                calls.push(QueryEngineCall {
+                    method: "answer".to_string(),
+                });
+            }
+            Ok(None)
         }
     }
 
@@ -1257,7 +1353,6 @@ pub mod mocks {
             content: "hello".to_string(),
             title: Some("note".to_string()),
             metadata: HashMap::new(),
-            embedding: Some(vec![0.1, 0.2]),
             observed_at: Utc::now(),
             content_hash: [7; 32],
         };

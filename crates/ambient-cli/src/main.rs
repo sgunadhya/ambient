@@ -20,7 +20,7 @@ use ambient_normalizer::{default_dispatch, NormalizerConsumer};
 use ambient_onboard::InMemoryCapabilityGate;
 use ambient_patterns::PatternScheduler;
 use ambient_query::build_runtime_components_with_weights;
-use ambient_reasoning::{EmbeddingQueue, RigReasoningEngine};
+use ambient_reasoning::{LensConsumer, RigReasoningEngine};
 use ambient_spotlight::CoreSpotlightExporter;
 use ambient_transport_local::{DefaultLoadPolicyProvider, LoadBroadcaster, SystemLoadSampler};
 use ambient_triggers::TriggerEngine;
@@ -69,7 +69,6 @@ impl LicenseGate for LocalLicenseGate {
 
 struct RuntimeStatusProbe {
     reasoning: Arc<RigReasoningEngine>,
-    embedding_queue: Arc<EmbeddingQueue>,
     load_tracker: Arc<RuntimeLoadTracker>,
     upserted_units: Arc<AtomicU64>,
     active_sources: Vec<String>,
@@ -87,7 +86,7 @@ impl DaemonStatusProbe for RuntimeStatusProbe {
     }
 
     fn queue_depth(&self) -> usize {
-        self.embedding_queue.queue_depth()
+        0
     }
 
     fn upserted_units(&self) -> u64 {
@@ -179,6 +178,9 @@ enum Commands {
         #[arg(long)]
         feedback: bool,
     },
+    Ask {
+        question: String,
+    },
     Unit {
         id: Uuid,
         #[arg(long, default_value_t = 3600)]
@@ -222,6 +224,7 @@ enum Commands {
         transport: String,
         payload_file: PathBuf,
     },
+    Reindex,
 }
 
 fn main() -> ExitCode {
@@ -303,10 +306,19 @@ fn run() -> Result<(), String> {
             let spotlight_exporter = Arc::new(CoreSpotlightExporter::default());
             let stream_provider = open_default_stream_provider().map_err(|e| e.to_string())?;
 
-            let embedding_queue = Arc::new(EmbeddingQueue::new(store.clone(), reasoning.clone()));
+            let lens_consumer = Arc::new(
+                LensConsumer::new(
+                    stream_provider.clone(),
+                    store.clone(),
+                    reasoning.clone(),
+                    "lens_indexer".to_string(),
+                )
+                .map_err(|e| e.to_string())?,
+            );
+            lens_consumer.clone().start();
 
             let broadcaster = Arc::new(LoadBroadcaster::default());
-            broadcaster.register(embedding_queue.clone() as Arc<dyn LoadAware>);
+            broadcaster.register(lens_consumer.clone() as Arc<dyn LoadAware>);
             let load_tracker = Arc::new(RuntimeLoadTracker::new());
             broadcaster.register(load_tracker.clone() as Arc<dyn LoadAware>);
             let system_load = Arc::new(SystemLoadSampler::new(
@@ -337,7 +349,6 @@ fn run() -> Result<(), String> {
             let ingest_store = store.clone();
             let ingest_dispatch = dispatch.clone();
             let ingest_exporter = spotlight_exporter.clone();
-            let ingest_queue = embedding_queue.clone();
             let ingest_triggers = triggers.clone();
             let upserted_units = Arc::new(AtomicU64::new(0));
             let ingest_upserted_units = upserted_units.clone();
@@ -368,7 +379,6 @@ fn run() -> Result<(), String> {
                     for unit in units {
                         ingest_upserted_units.fetch_add(1, Ordering::Relaxed);
                         let _ = ingest_exporter.export(&unit);
-                        let _ = ingest_queue.enqueue(unit.id, unit.content.clone());
                         ingest_triggers.clone().on_upsert_background(unit);
                     }
                 }
@@ -431,7 +441,6 @@ fn run() -> Result<(), String> {
                     auth_token: config.auth_token.clone(),
                     status_probe: Some(Arc::new(RuntimeStatusProbe {
                         reasoning,
-                        embedding_queue,
                         load_tracker,
                         upserted_units,
                         active_sources,
@@ -461,6 +470,13 @@ fn run() -> Result<(), String> {
             } else {
                 post_json(&cli.server, cli.token.as_deref(), "/query", &body)
             }
+        }
+        Commands::Ask { question } => {
+            let body = serde_json::json!({
+                "question": question,
+                "k": 5
+            });
+            post_json(&cli.server, cli.token.as_deref(), "/ask", &body)
         }
         Commands::Unit { id, window } => get(
             &cli.server,
@@ -535,6 +551,14 @@ fn run() -> Result<(), String> {
                 &format!("/transport/{transport}/push"),
                 payload,
             )
+        }
+        Commands::Reindex => {
+            let stream_provider = open_default_stream_provider().map_err(|e| e.to_string())?;
+            stream_provider
+                .commit(&"lens_indexer".to_string(), 0)
+                .map_err(|e: ambient_core::CoreError| e.to_string())?;
+            println!("Lens indexer offset reset to 0. Restart the daemon to trigger re-indexing.");
+            Ok(())
         }
     }
 }

@@ -19,5 +19,5 @@ members = [
   "crates/ambient-menubar",
   "crates/ambient-onboard",
   "crates/ambient-cli",
-  "tests/integration",
+  "tests/integration", "crates/ambient-lenses",
 ]

@@ -440,7 +440,6 @@ mod tests {
             content: "x".to_string(),
             title: Some("x".to_string()),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at: Utc::now(),
             content_hash: [1; 32],
         };

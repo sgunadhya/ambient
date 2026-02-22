@@ -44,7 +44,6 @@ fn phase2_unit_with_context_derives_state() {
             content: "note".to_string(),
             title: Some("note".to_string()),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at,
             content_hash: [9; 32],
         })

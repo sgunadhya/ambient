@@ -15,11 +15,10 @@ use std::time::{Duration, Instant};
 
 use ambient_core::{
     CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore, KnowledgeUnit,
-    QueryRequest, QueryResult, Result, ResultAction, SourceId,
+    QueryRequest, QueryResult, Result, ResultAction, SourceId, Uuid,
 };
 use chrono::{Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
-use uuid::Uuid;
 
 // ── PatternInsight ─────────────────────────────────────────────────────────────
 
@@ -646,7 +645,6 @@ fn persist_pattern_results(
             content,
             title: Some(format!("Pattern Insight — {}", insight.key)),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at: Utc::now(),
             content_hash,
         };
@@ -837,6 +835,16 @@ mod tests {
         fn pattern_feedback(&self, _id: Uuid) -> AResult<Option<String>> {
             Ok(None)
         }
+        fn upsert_lens(&self, _id: Uuid, _l: &str, _v: Vec<f32>) -> AResult<()> {
+            Ok(())
+        }
+        fn search_lens(&self, _l: &str, _v: &[f32], _k: usize) -> AResult<Vec<KnowledgeUnit>> {
+            Ok(self.units.lock().unwrap().clone())
+        }
+
+        fn calculate_temporal_profile(&self, _unit_id: Uuid) -> AResult<()> {
+            Ok(())
+        }
     }
 
     fn make_result(was_in_flow: bool, was_on_call: bool, hour: u8) -> QueryResult {
@@ -846,7 +854,6 @@ mod tests {
             content: "test content".to_string(),
             title: Some("Test Note".to_string()),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at: Utc::now(),
             content_hash: [0u8; 32],
         };

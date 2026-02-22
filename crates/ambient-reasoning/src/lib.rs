@@ -1,18 +1,18 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
 use ambient_core::{
-    CoreError, KnowledgeStore, KnowledgeUnit, LoadAware, ReasoningBackend, ReasoningEngine, Result,
-    SystemLoad,
+    CoreError, EventLogEntry, KnowledgeConsumer, KnowledgeStore, KnowledgeUnit, LoadAware,
+    RawPayload, ReasoningBackend, ReasoningEngine, Result, StreamProvider, SystemLoad,
 };
+use ambient_lenses::{LensRouter, MultiLensRouter};
 use rig::client::{CompletionClient, EmbeddingsClient, Nothing};
 use rig::completion::Prompt;
 use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
 use rig::providers::{ollama, openai};
 use tracing::{debug, info};
-use uuid::Uuid;
 
 pub struct RigReasoningEngine {
     pub backend: ReasoningBackend,
@@ -117,12 +117,20 @@ impl RigReasoningEngine {
 
 impl ReasoningEngine for RigReasoningEngine {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        debug!(text_len = text.len(), "requesting embedding from backend");
+        self.embed_with_model(text, &self.embedding_model_name)
+    }
+
+    fn embed_with_model(&self, text: &str, model: &str) -> Result<Vec<f32>> {
+        debug!(
+            text_len = text.len(),
+            model = model,
+            "requesting embedding from backend"
+        );
         if !self.reasoning_available() {
             return Err(CoreError::Unsupported("reasoning backend unavailable"));
         }
 
-        let model_name = self.embedding_model_name.clone();
+        let model_name = model.to_string();
         let text = text.to_string();
         let (tx, rx) = mpsc::channel();
 
@@ -240,89 +248,79 @@ impl ReasoningEngine for RigReasoningEngine {
     }
 }
 
-pub struct EmbeddingQueue {
-    tx: mpsc::Sender<(Uuid, String)>,
+pub struct LensConsumer {
+    consumer: KnowledgeConsumer,
+    store: Arc<dyn KnowledgeStore>,
+    router: Arc<dyn LensRouter>,
     paused: Arc<AtomicBool>,
-    queue_depth: Arc<Mutex<usize>>,
 }
 
-impl EmbeddingQueue {
-    pub fn new(store: Arc<dyn KnowledgeStore>, reasoning: Arc<dyn ReasoningEngine>) -> Self {
-        let (tx, rx) = mpsc::channel::<(Uuid, String)>();
-        let shared_rx = Arc::new(Mutex::new(rx));
-        let paused = Arc::new(AtomicBool::new(false));
-        let queue_depth = Arc::new(Mutex::new(0usize));
+impl LensConsumer {
+    pub fn new(
+        provider: Arc<dyn StreamProvider>,
+        store: Arc<dyn KnowledgeStore>,
+        reasoning: Arc<dyn ReasoningEngine>,
+        consumer_id: String,
+    ) -> Result<Self> {
+        let consumer = KnowledgeConsumer::new(provider, consumer_id)?;
+        let router = Arc::new(MultiLensRouter::new(reasoning));
+        Ok(Self {
+            consumer,
+            store,
+            router,
+            paused: Arc::new(AtomicBool::new(false)),
+        })
+    }
 
-        for _ in 0..2 {
-            let worker_rx = Arc::clone(&shared_rx);
-            let worker_store = Arc::clone(&store);
-            let worker_reasoning = Arc::clone(&reasoning);
-            let worker_paused = Arc::clone(&paused);
-            let worker_depth = Arc::clone(&queue_depth);
-            thread::spawn(move || loop {
-                if worker_paused.load(Ordering::Relaxed) {
-                    thread::sleep(Duration::from_millis(50));
-                    continue;
+    pub fn start(self: Arc<Self>) {
+        let worker = Arc::clone(&self);
+        thread::spawn(move || loop {
+            if worker.paused.load(Ordering::Relaxed) {
+                thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
+            let res = worker.consumer.poll(10, |_, entry| {
+                if let EventLogEntry::Raw(raw) = entry {
+                    if let RawPayload::KnowledgeUnitSync { unit, .. } = raw.payload {
+                        debug!(unit_id = %unit.id, "processing decoupled multi-lens indexing job");
+
+                        // L1, L2, L5: Embeddings
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| {
+                                CoreError::Internal(format!("tokio runtime init failed: {e}"))
+                            })?;
+
+                        if let Ok(embeddings) = rt.block_on(worker.router.embed_all(&unit)) {
+                            for (lens_id, vec) in embeddings {
+                                let _ = worker.store.upsert_lens(unit.id, lens_id.as_str(), vec);
+                            }
+                        }
+
+                        // L4: Temporal Profile
+                        let _ = worker.store.calculate_temporal_profile(unit.id);
+                    }
                 }
-
-                let job = {
-                    let Ok(guard) = worker_rx.lock() else {
-                        return;
-                    };
-                    guard.recv()
-                };
-
-                let Ok((id, text)) = job else {
-                    return;
-                };
-
-                debug!(unit_id = %id, "processing background embedding job");
-
-                if let Ok(mut depth) = worker_depth.lock() {
-                    *depth = depth.saturating_sub(1);
-                }
-
-                let Ok(mut unit) = worker_store.get_by_id(id).and_then(|u| {
-                    u.ok_or_else(|| CoreError::NotFound(format!("unit {id} not found")))
-                }) else {
-                    continue;
-                };
-
-                if let Ok(embedding) = worker_reasoning.embed(&text) {
-                    unit.embedding = Some(embedding);
-                    let _ = worker_store.upsert(unit);
-                }
+                Ok(())
             });
-        }
 
-        Self {
-            tx,
-            paused,
-            queue_depth,
-        }
-    }
-
-    pub fn enqueue(&self, id: Uuid, text: String) -> Result<()> {
-        self.tx
-            .send((id, text))
-            .map_err(|e| CoreError::Internal(format!("enqueue failed: {e}")))?;
-        if let Ok(mut depth) = self.queue_depth.lock() {
-            *depth += 1;
-        }
-        Ok(())
-    }
-
-    pub fn queue_depth(&self) -> usize {
-        self.queue_depth.lock().map(|d| *d).unwrap_or(0)
+            if let Err(e) = res {
+                debug!("lens consumer poll error: {e}");
+                thread::sleep(Duration::from_millis(1000));
+            } else {
+                thread::sleep(Duration::from_millis(250));
+            }
+        });
     }
 }
 
-impl LoadAware for EmbeddingQueue {
+impl LoadAware for LensConsumer {
     fn on_load_change(&self, load: SystemLoad) {
         match load {
             SystemLoad::Unconstrained => self.paused.store(false, Ordering::Relaxed),
-            SystemLoad::Conservative => self.paused.store(true, Ordering::Relaxed),
-            SystemLoad::Minimal => self.paused.store(true, Ordering::Relaxed),
+            _ => self.paused.store(true, Ordering::Relaxed),
         }
     }
 }

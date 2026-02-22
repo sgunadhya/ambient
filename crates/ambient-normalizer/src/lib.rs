@@ -2,11 +2,11 @@ pub mod applenotes;
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use ambient_core::{
-    ConsumerId, CoreError, EventLogEntry, KnowledgeStore, KnowledgeUnit, Normalizer, Offset,
-    RawEvent, RawPayload, Result, SourceId, StreamProvider,
+    ConsumerId, CoreError, EventLogEntry, KnowledgeConsumer, KnowledgeStore, KnowledgeUnit,
+    Normalizer, RawEvent, RawPayload, Result, SourceId, StreamProvider,
 };
 use chrono::Utc;
 use serde_json::{json, Value};
@@ -32,11 +32,9 @@ impl NormalizerDispatch {
 }
 
 pub struct NormalizerConsumer {
-    provider: Arc<dyn StreamProvider>,
+    consumer: KnowledgeConsumer,
     store: Arc<dyn KnowledgeStore>,
     dispatch: Arc<NormalizerDispatch>,
-    consumer_id: ConsumerId,
-    offset: Mutex<Offset>,
 }
 
 impl NormalizerConsumer {
@@ -46,24 +44,18 @@ impl NormalizerConsumer {
         dispatch: Arc<NormalizerDispatch>,
         consumer_id: ConsumerId,
     ) -> Result<Self> {
-        let offset = provider.last_committed(&consumer_id)?.unwrap_or(0);
+        let consumer = KnowledgeConsumer::new(provider, consumer_id)?;
         Ok(Self {
-            provider,
+            consumer,
             store,
             dispatch,
-            consumer_id,
-            offset: Mutex::new(offset),
         })
     }
 
     pub fn poll_once(&self, limit: usize) -> Result<Vec<KnowledgeUnit>> {
-        let mut offset = self.offset.lock().map_err(|_| {
-            CoreError::Internal("normalizer consumer offset lock poisoned".to_string())
-        })?;
-        let batch = self.provider.read(&self.consumer_id, *offset, limit)?;
         let mut out = Vec::new();
 
-        for (next_offset, entry) in batch {
+        self.consumer.poll(limit, |_, entry| {
             match entry {
                 EventLogEntry::Raw(raw) => match raw.payload.clone() {
                     RawPayload::FeedbackEventSync { event, .. } => {
@@ -75,8 +67,17 @@ impl NormalizerConsumer {
                         }
                     }
                     _ => {
-                        if let Ok(unit) = self.dispatch.normalize(raw) {
+                        if let Ok(unit) = self.dispatch.normalize(raw.clone()) {
                             if self.store.upsert(unit.clone()).is_ok() {
+                                // Emit sync event for decoupled consumers (LensConsumer)
+                                let _ = self.consumer.provider().append_raw(RawEvent {
+                                    source: raw.source,
+                                    timestamp: Utc::now(),
+                                    payload: RawPayload::KnowledgeUnitSync {
+                                        unit: Box::new(unit.clone()),
+                                        device_origin: "local".to_string(), // TODO: use actual device ID
+                                    },
+                                });
                                 out.push(unit);
                             }
                         }
@@ -84,9 +85,8 @@ impl NormalizerConsumer {
                 },
                 EventLogEntry::Pulse(_) => {}
             }
-            self.provider.commit(&self.consumer_id, next_offset)?;
-            *offset = next_offset;
-        }
+            Ok(())
+        })?;
 
         Ok(out)
     }
@@ -161,7 +161,6 @@ impl Normalizer for MarkdownNormalizer {
             content: plain,
             title,
             metadata,
-            embedding: None,
             observed_at: event.timestamp,
         })
     }
@@ -255,7 +254,6 @@ impl Normalizer for AppleNotesNormalizer {
             content,
             title: Some("Apple Note".to_string()),
             metadata,
-            embedding: None,
             observed_at: modified_at,
         })
     }
@@ -342,7 +340,6 @@ impl Normalizer for SpotlightNormalizer {
             content: text_content,
             title: Some(title),
             metadata,
-            embedding: None,
             observed_at: last_modified,
         })
     }
@@ -410,7 +407,6 @@ impl Normalizer for PlainTextNormalizer {
             content,
             title: stem(&path),
             metadata,
-            embedding: None,
             observed_at: event.timestamp,
         })
     }
@@ -481,7 +477,6 @@ impl Normalizer for HealthKitNormalizer {
             content,
             title,
             metadata,
-            embedding: None,
             observed_at: recorded_at,
         })
     }
@@ -563,7 +558,6 @@ impl Normalizer for CalendarNormalizer {
             content,
             title: Some(title),
             metadata,
-            embedding: None,
             observed_at: start,
         })
     }
@@ -633,7 +627,6 @@ impl Normalizer for SelfReportNormalizer {
             content,
             title: Some(format!("Check-in — {}", reported_at.date_naive())),
             metadata,
-            embedding: None,
             observed_at: reported_at,
         })
     }
@@ -758,7 +751,6 @@ impl Normalizer for BehavioralSummaryNormalizer {
             content,
             title: Some("Behavioral Summary".to_string()),
             metadata,
-            embedding: None,
             observed_at: period_end,
         })
     }

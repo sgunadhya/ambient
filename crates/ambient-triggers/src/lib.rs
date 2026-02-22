@@ -38,9 +38,17 @@ impl TriggerCondition for BuiltInCondition {
 }
 
 pub enum BuiltInAction {
-    MacOSNotification { title: String, body_template: String },
-    Webhook { url: String, method: String },
-    RunScript { path: PathBuf },
+    MacOSNotification {
+        title: String,
+        body_template: String,
+    },
+    Webhook {
+        url: String,
+        method: String,
+    },
+    RunScript {
+        path: PathBuf,
+    },
 }
 
 impl TriggerAction for BuiltInAction {
@@ -52,8 +60,10 @@ impl TriggerAction for BuiltInAction {
             } => {
                 #[cfg(target_os = "macos")]
                 {
-                    let body = body_template.replace("{title}", unit.title.as_deref().unwrap_or("untitled"));
-                    let script = format!("display notification \"{}\" with title \"{}\"", body, title);
+                    let body = body_template
+                        .replace("{title}", unit.title.as_deref().unwrap_or("untitled"));
+                    let script =
+                        format!("display notification \"{}\" with title \"{}\"", body, title);
                     let _ = Command::new("osascript").arg("-e").arg(script).output();
                 }
                 #[cfg(not(target_os = "macos"))]
@@ -64,7 +74,9 @@ impl TriggerAction for BuiltInAction {
             }
             BuiltInAction::Webhook { url, method: _ } => {
                 if url.is_empty() {
-                    return Err(CoreError::InvalidInput("webhook url cannot be empty".to_string()));
+                    return Err(CoreError::InvalidInput(
+                        "webhook url cannot be empty".to_string(),
+                    ));
                 }
                 let client = reqwest::blocking::Client::builder()
                     .timeout(Duration::from_secs(5))
@@ -106,7 +118,10 @@ impl TriggerAction for BuiltInAction {
             }
             BuiltInAction::RunScript { path } => {
                 if !path.exists() {
-                    return Err(CoreError::NotFound(format!("script not found: {}", path.display())));
+                    return Err(CoreError::NotFound(format!(
+                        "script not found: {}",
+                        path.display()
+                    )));
                 }
                 let output = Command::new(path)
                     .arg(unit.id.to_string())
@@ -140,9 +155,17 @@ enum ConditionConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum ActionConfig {
-    MacOsNotification { title: String, body_template: String },
-    Webhook { url: String, method: String },
-    RunScript { path: PathBuf },
+    MacOsNotification {
+        title: String,
+        body_template: String,
+    },
+    Webhook {
+        url: String,
+        method: String,
+    },
+    RunScript {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -226,7 +249,10 @@ impl TriggerEngine {
             Err(_) => return,
         };
         for rule in rules.iter() {
-            let should_fire = rule.condition.evaluate(unit, self.store.as_ref()).unwrap_or(false);
+            let should_fire = rule
+                .condition
+                .evaluate(unit, self.store.as_ref())
+                .unwrap_or(false);
             if should_fire {
                 let _ = rule.action.fire(unit);
             }
@@ -278,7 +304,9 @@ fn load_rules(path: &Path) -> Result<Vec<TriggerRule>> {
                 title,
                 body_template,
             }),
-            ActionConfig::Webhook { url, method } => Arc::new(BuiltInAction::Webhook { url, method }),
+            ActionConfig::Webhook { url, method } => {
+                Arc::new(BuiltInAction::Webhook { url, method })
+            }
             ActionConfig::RunScript { path } => Arc::new(BuiltInAction::RunScript { path }),
         };
 
@@ -331,7 +359,6 @@ mod tests {
             content: "x".to_string(),
             title: Some("x".to_string()),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at: Utc::now(),
             content_hash: [1; 32],
         };

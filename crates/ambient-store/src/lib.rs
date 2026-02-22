@@ -99,7 +99,6 @@ impl CozoStore {
     title: String,
     content: String,
     hash: String,
-    embedding: <F32; 768>?,
     observed_at: Float
 }
 :create links {
@@ -141,18 +140,34 @@ impl CozoStore {
     sleep_quality: Float?,
     minutes_since_last_meeting: Int?
 }
+:create lens_map {
+    unit_id: String,
+    lens_id: String =>
+    vec: <F32; 768>?
+}
+:create lens_map_384 {
+    unit_id: String,
+    lens_id: String =>
+    vec: <F32; 384>?
+}
+:create temporal_profile {
+    unit_id: String =>
+    hour_peak: Int,
+    day_mask: Int,
+    recency_weight: Float
+}
 "#;
 
         let _ = self
             .cozo
             .run_script(schema, BTreeMap::new(), ScriptMutability::Mutable);
 
-        // HNSW Vector Index setup
-        let hnsw_schema = r#"
-::hnsw create notes:embedding_idx {
+        // HNSW Vector Index for the lens_map table (L1/L2 at 768D)
+        let hnsw_768_schema = r#"
+::hnsw create lens_map:vec_idx {
     dim: 768,
     dtype: F32,
-    fields: [embedding],
+    fields: [vec],
     distance: Cosine,
     ef_construction: 200,
     m: 16
@@ -160,7 +175,22 @@ impl CozoStore {
 "#;
         let _ = self
             .cozo
-            .run_script(hnsw_schema, BTreeMap::new(), ScriptMutability::Mutable);
+            .run_script(hnsw_768_schema, BTreeMap::new(), ScriptMutability::Mutable);
+
+        // HNSW Vector Index for the lens_map_384 table (L5 at 384D)
+        let hnsw_384_schema = r#"
+::hnsw create lens_map_384:vec_idx {
+    dim: 384,
+    dtype: F32,
+    fields: [vec],
+    distance: Cosine,
+    ef_construction: 200,
+    m: 16
+}
+"#;
+        let _ = self
+            .cozo
+            .run_script(hnsw_384_schema, BTreeMap::new(), ScriptMutability::Mutable);
 
         // FTS Setup
         let fts_schema = r#"
@@ -187,21 +217,16 @@ impl CozoStore {
             "hash".to_string(),
             DataValue::from(hash_to_string(&unit.content_hash)),
         );
-        let embedding_val = match &unit.embedding {
-            Some(vec) => DataValue::List(vec.iter().map(|f| DataValue::from(*f as f64)).collect()),
-            None => DataValue::Null,
-        };
-        params.insert("embedding".to_string(), embedding_val);
         params.insert(
             "observed_at".to_string(),
             DataValue::from(unit.observed_at.timestamp_millis() as f64),
         );
 
         let script = r#"
-?[id, source, title, content, hash, embedding, observed_at] <- [[
-    $id, $source, $title, $content, $hash, $embedding, $observed_at
+?[id, source, title, content, hash, observed_at] <- [[
+    $id, $source, $title, $content, $hash, $observed_at
 ]]
-:put notes { id => source, title, content, hash, embedding, observed_at }
+:put notes { id => source, title, content, hash, observed_at }
 "#;
         let _ = self
             .cozo
@@ -370,6 +395,18 @@ impl CozoStore {
                 None,
                 None,
                 Some(pattern_id.to_string()),
+            ),
+            FeedbackSignal::OracleResultActedOn {
+                query_text,
+                unit_id,
+                action,
+                ..
+            } => (
+                "oracle_result_acted_on".to_string(),
+                Some(unit_id.to_string()),
+                Some(query_text.clone()),
+                Some(format!("{action:?}")),
+                None,
             ),
         };
 
@@ -636,10 +673,10 @@ impl CozoStore {
 
 /// Private helper methods for CozoStore — not part of the KnowledgeStore trait.
 impl CozoStore {
-    /// Decode a CozoDB result row `[id, source, title, content, hash, embedding, observed_at, ...]`
+    /// Decode a CozoDB result row `[id, source, title, content, hash, observed_at, ...]`
     /// into a `KnowledgeUnit`. The optional trailing column (dist / score) is ignored.
     fn row_to_knowledge_unit(&self, row: &[DataValue]) -> Option<KnowledgeUnit> {
-        if row.len() < 7 {
+        if row.len() < 6 {
             return None;
         }
         let id_str = match &row[0] {
@@ -669,28 +706,7 @@ impl CozoStore {
             }
             _ => [0u8; 32],
         };
-        // CozoDB Num is either Int or Float internally; convert to f32 via i64/f64 match.
-        let num_to_f32 = |v: &DataValue| -> Option<f32> {
-            match v {
-                DataValue::Num(n) => match n {
-                    cozo::Num::Int(i) => Some(*i as f32),
-                    cozo::Num::Float(f) => Some(*f as f32),
-                },
-                _ => None,
-            }
-        };
-        let embedding = match &row[5] {
-            DataValue::List(vals) => {
-                let v: Vec<f32> = vals.iter().filter_map(num_to_f32).collect();
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                }
-            }
-            _ => None,
-        };
-        let observed_at_ms: i64 = match &row[6] {
+        let observed_at_ms: i64 = match &row[5] {
             DataValue::Num(n) => match n {
                 cozo::Num::Int(i) => *i,
                 cozo::Num::Float(f) => *f as i64,
@@ -705,7 +721,6 @@ impl CozoStore {
             title,
             content,
             content_hash,
-            embedding,
             observed_at,
             metadata: std::collections::HashMap::new(),
         })
@@ -808,11 +823,11 @@ impl KnowledgeStore for CozoStore {
         params.insert("k".to_string(), DataValue::from(k as i64));
 
         // Join HNSW neighbor results with the notes relation in one Datalog statement.
-        // Per NEXT.md Amendment 1 — no in-memory cache dependency.
+        // Updated for V2: query lens_map:vec_idx and join with notes (no embedding column).
         let script = r#"
-?[id, source, title, content, hash, embedding, observed_at, dist] :=
-    ~notes:embedding_idx{ id | query: $vec, k: $k, ef: 50, bind_distance: dist },
-    *notes{ id, source, title, content, hash, embedding, observed_at }
+?[id, source, title, content, hash, observed_at, dist] :=
+    ~lens_map:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist },
+    *notes{ id, source, title, content, hash, observed_at }
 :order dist
 :limit $k
 "#;
@@ -845,9 +860,9 @@ impl KnowledgeStore for CozoStore {
             params.insert("k".to_string(), DataValue::from(50i64));
 
             let script = r#"
-?[id, source, title, content, hash, embedding, observed_at, score] :=
+?[id, source, title, content, hash, observed_at, score] :=
     ~notes:fts{ id, title, content | query: $query, k: $k, score_field: score },
-    *notes{ id, source, hash, embedding, observed_at }
+    *notes{ id, source, hash, observed_at }
 :order -score
 :limit $k
 "#;
@@ -1055,6 +1070,125 @@ impl KnowledgeStore for CozoStore {
 
         Ok(None)
     }
+
+    fn upsert_lens(&self, unit_id: Uuid, lens_id: &str, vec: Vec<f32>) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("unit_id".to_string(), DataValue::from(unit_id.to_string()));
+        params.insert("lens_id".to_string(), DataValue::from(lens_id.to_string()));
+        params.insert(
+            "vec".to_string(),
+            DataValue::List(vec.iter().map(|f| DataValue::from(*f as f64)).collect()),
+        );
+
+        let script = if lens_id == "l5_social" {
+            r#"
+?[unit_id, lens_id, vec] <- [[$unit_id, $lens_id, $vec]]
+:put lens_map_384 { unit_id, lens_id => vec }
+"#
+        } else {
+            r#"
+?[unit_id, lens_id, vec] <- [[$unit_id, $lens_id, $vec]]
+:put lens_map { unit_id, lens_id => vec }
+"#
+        };
+
+        self.cozo
+            .run_script(script, params, ScriptMutability::Mutable)
+            .map_err(|e| CoreError::Internal(format!("failed to upsert lens: {e}")))?;
+        Ok(())
+    }
+
+    fn search_lens(
+        &self,
+        lens_id: &str,
+        query_vec: &[f32],
+        k: usize,
+    ) -> Result<Vec<KnowledgeUnit>> {
+        if query_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert("lens_id".to_string(), DataValue::from(lens_id.to_string()));
+        params.insert(
+            "vec".to_string(),
+            DataValue::List(
+                query_vec
+                    .iter()
+                    .map(|f| DataValue::from(*f as f64))
+                    .collect(),
+            ),
+        );
+        params.insert("k".to_string(), DataValue::from(k as i64));
+
+        let script = if lens_id == "l5_social" {
+            r#"
+?[id, source, title, content, hash, observed_at, dist] :=
+    ~lens_map_384:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist, filter: (lens_id == $lens_id) },
+    *notes{ id, source, title, content, hash, observed_at }
+:order dist
+:limit $k
+"#
+        } else {
+            r#"
+?[id, source, title, content, hash, observed_at, dist] :=
+    ~lens_map:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist, filter: (lens_id == $lens_id) },
+    *notes{ id, source, title, content, hash, observed_at }
+:order dist
+:limit $k
+"#
+        };
+        match self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+        {
+            Ok(result) => {
+                let out = result
+                    .rows
+                    .iter()
+                    .filter_map(|row| self.row_to_knowledge_unit(row))
+                    .collect();
+                Ok(out)
+            }
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn calculate_temporal_profile(&self, unit_id: Uuid) -> Result<()> {
+        let (unit, _pulse, _) = self.unit_with_context(unit_id, 3600)?.ok_or_else(|| {
+            CoreError::NotFound("unit not found for temporal profiling".to_string())
+        })?;
+
+        let mut params = BTreeMap::new();
+        params.insert("unit_id".to_string(), DataValue::from(unit.id.to_string()));
+        params.insert(
+            "hour_peak".to_string(),
+            DataValue::from(unit.observed_at.hour() as i64),
+        );
+        params.insert(
+            "day_mask".to_string(),
+            DataValue::from(1 << (unit.observed_at.weekday() as u32)),
+        );
+
+        // Simple recency: linear decay over 30 days
+        let days_old = (Utc::now() - unit.observed_at).num_days();
+        let recency = (30.0 - days_old as f32).max(0.0) / 30.0;
+        params.insert(
+            "recency_weight".to_string(),
+            DataValue::from(recency as f64),
+        );
+
+        let script = r#"
+?[unit_id, hour_peak, day_mask, recency_weight] <- [[
+    $unit_id, $hour_peak, $day_mask, $recency_weight
+]]
+:put temporal_profile { unit_id => hour_peak, day_mask, recency_weight }
+"#;
+        self.cozo
+            .run_script(script, params, ScriptMutability::Mutable)
+            .map(|_| ())
+            .map_err(|e| CoreError::Internal(format!("temporal profiling failed: {e}")))
+    }
 }
 
 fn expand_home(path: &str) -> PathBuf {
@@ -1152,7 +1286,6 @@ mod tests {
                 content: "test note".to_string(),
                 title: Some("title".to_string()),
                 metadata: HashMap::new(),
-                embedding: None,
                 observed_at,
                 content_hash: [1; 32],
             })

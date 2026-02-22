@@ -100,7 +100,7 @@ impl AmbientQueryEngine {
         Ok(out)
     }
 
-    pub fn answer(&self, question: &str, req: &QueryRequest) -> Result<Option<String>> {
+    pub fn answer_internal(&self, question: &str, req: &QueryRequest) -> Result<Option<String>> {
         let Some(reasoning) = &self.reasoning else {
             return Ok(None);
         };
@@ -183,6 +183,10 @@ impl QueryEngine for AmbientQueryEngine {
         }
 
         Ok(out)
+    }
+
+    fn answer(&self, question: &str, req: QueryRequest) -> Result<Option<String>> {
+        self.answer_internal(question, &req)
     }
 }
 

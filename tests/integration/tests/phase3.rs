@@ -15,18 +15,22 @@ fn phase3_query_engine_ranking_and_fallback() {
     let store = Arc::new(CozoStore::new().expect("store"));
 
     for i in 0..10 {
+        let id = uuid::Uuid::new_v4();
+        let vec = vec![i as f32, (10 - i) as f32];
         store
             .upsert(KnowledgeUnit {
-                id: uuid::Uuid::new_v4(),
+                id,
                 source: SourceId::new("obsidian"),
                 content: format!("distributed systems note {i}"),
                 title: Some(format!("Note {i}")),
                 metadata: HashMap::new(),
-                embedding: Some(vec![i as f32, (10 - i) as f32]),
                 observed_at: Utc::now(),
                 content_hash: [i as u8; 32],
             })
             .expect("upsert");
+        store
+            .upsert_lens(id, "l1_semantic", vec)
+            .expect("upsert lens");
     }
 
     let engine = AmbientQueryEngine::new(store.clone(), None);
@@ -54,7 +58,6 @@ fn phase3_query_engine_ranking_and_fallback() {
             content: "panic notes fallback".to_string(),
             title: Some("Fallback".to_string()),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at: Utc::now(),
             content_hash: [7; 32],
         })

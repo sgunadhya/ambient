@@ -657,7 +657,6 @@ pub fn submit_checkin(
         content,
         title: Some(format!("Check-in — {}", observed_at.format("%Y-%m-%d"))),
         metadata,
-        embedding: None,
         observed_at,
         content_hash,
     };
@@ -773,6 +772,13 @@ pub struct QueryHttpRequest {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AskHttpRequest {
+    pub question: String,
+    pub context_text: Option<String>,
+    pub k: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct CheckinRequest {
     pub energy: u8,
     pub mood: u8,
@@ -832,6 +838,7 @@ pub trait DaemonStatusProbe: Send + Sync {
 pub fn build_router(state: HttpAppState) -> Router {
     Router::new()
         .route("/query", post(http_query))
+        .route("/ask", post(http_ask))
         .route("/unit/:id", get(http_unit))
         .route("/related/:id", get(http_related))
         .route("/health", get(http_health))
@@ -875,6 +882,28 @@ async fn http_query(
         include_pulse_context: req.include_pulse_context,
         context_window_secs: req.context_window_secs,
     });
+    map_result(result)
+}
+
+async fn http_ask(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<AskHttpRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+
+    let query_text = req.context_text.unwrap_or_else(|| req.question.clone());
+    let result = state.engine.answer(
+        &req.question,
+        QueryRequest {
+            text: query_text,
+            k: req.k,
+            include_pulse_context: false,
+            context_window_secs: None,
+        },
+    );
     map_result(result)
 }
 
@@ -1256,7 +1285,6 @@ mod tests {
             content: "hello".to_string(),
             title: Some("hello".to_string()),
             metadata: HashMap::new(),
-            embedding: None,
             observed_at: chrono::Utc::now(),
             content_hash: [1; 32],
         };
