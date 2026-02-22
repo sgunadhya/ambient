@@ -197,7 +197,7 @@ pub fn build_runtime_components_with_weights(
     feedback_weight: f32,
     reasoning: Option<Arc<dyn ReasoningEngine>>,
 ) -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
-    let store: Arc<dyn KnowledgeStore> = Arc::new(CozoStore::new_for_test()?);
+    let store: Arc<dyn KnowledgeStore> = Arc::new(CozoStore::new()?);
     let engine: Arc<dyn QueryEngine> = Arc::new(
         AmbientQueryEngine::new(store.clone(), reasoning)
             .with_weights(semantic_weight, feedback_weight),
