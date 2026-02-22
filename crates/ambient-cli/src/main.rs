@@ -78,8 +78,8 @@ struct RuntimeStatusProbe {
 }
 
 impl DaemonStatusProbe for RuntimeStatusProbe {
-    fn embedding_available(&self) -> bool {
-        self.reasoning.embedding_available()
+    fn reasoning_available(&self) -> bool {
+        self.reasoning.reasoning_available()
     }
 
     fn load(&self) -> String {
@@ -274,11 +274,22 @@ fn run() -> Result<(), String> {
 
             let daemon_pid_path = default_daemon_pid_path()?;
             let _pid_guard = DaemonPidGuard::create(daemon_pid_path)?;
-            let reasoning = Arc::new(RigReasoningEngine::new(
-                ambient_core::ReasoningBackend::Local {
-                    ollama_base_url: "http://localhost:11434".to_string(),
+
+            let backend = match config.reasoning_type.as_str() {
+                "openai" => ambient_core::ReasoningBackend::OpenAI {
+                    base_url: config.reasoning_url.clone(),
+                    api_key: config.reasoning_api_key.clone(),
                 },
-            ));
+                _ => ambient_core::ReasoningBackend::Local {
+                    ollama_base_url: config.reasoning_url.clone(),
+                },
+            };
+
+            let reasoning = Arc::new(
+                RigReasoningEngine::new(backend)
+                    .with_embedding_model(config.embedding_model.clone())
+                    .with_completion_model(config.completion_model.clone()),
+            );
             reasoning.start_ollama_probe();
 
             let (engine, store) = build_runtime_components_with_weights(

@@ -267,6 +267,11 @@ pub struct AmbientConfig {
     pub cloudkit_native_bridge_cmd: Option<String>,
     pub http_port: u16,
     pub auth_token: Option<String>,
+    pub reasoning_type: String,
+    pub reasoning_url: String,
+    pub reasoning_api_key: Option<String>,
+    pub embedding_model: String,
+    pub completion_model: String,
 }
 
 impl Default for AmbientConfig {
@@ -304,6 +309,11 @@ impl Default for AmbientConfig {
             cloudkit_native_bridge_cmd: None,
             http_port: 7474,
             auth_token: None,
+            reasoning_type: "ollama".to_string(),
+            reasoning_url: "http://localhost:11434".to_string(),
+            reasoning_api_key: None,
+            embedding_model: "nomic-embed-text".to_string(),
+            completion_model: "llama3.2".to_string(),
         }
     }
 }
@@ -328,6 +338,8 @@ struct ConfigFile {
     cloudkit: CloudKitConfig,
     #[serde(default)]
     daemon: DaemonConfig,
+    #[serde(default)]
+    reasoning: ReasoningConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -438,6 +450,29 @@ impl Default for QueryConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct ReasoningConfig {
+    #[serde(rename = "type")]
+    backend_type: String,
+    url: String,
+    api_key: Option<String>,
+    embedding_model: String,
+    completion_model: String,
+}
+
+impl Default for ReasoningConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            backend_type: d.reasoning_type,
+            url: d.reasoning_url,
+            api_key: d.reasoning_api_key,
+            embedding_model: d.embedding_model,
+            completion_model: d.completion_model,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CloudKitConfig {
     container: String,
     zone_name: String,
@@ -534,6 +569,11 @@ impl AmbientConfig {
                     Some(token)
                 }
             }),
+            reasoning_type: parsed.reasoning.backend_type,
+            reasoning_url: parsed.reasoning.url,
+            reasoning_api_key: parsed.reasoning.api_key,
+            embedding_model: parsed.reasoning.embedding_model,
+            completion_model: parsed.reasoning.completion_model,
         })
     }
 }
@@ -778,7 +818,7 @@ pub struct UnitParams {
 }
 
 pub trait DaemonStatusProbe: Send + Sync {
-    fn embedding_available(&self) -> bool;
+    fn reasoning_available(&self) -> bool;
     fn load(&self) -> String;
     fn queue_depth(&self) -> usize;
     fn upserted_units(&self) -> u64;
@@ -914,7 +954,7 @@ async fn http_health(State(state): State<HttpAppState>, headers: HeaderMap) -> R
         transport_statuses,
     ) = match &state.status_probe {
         Some(probe) => (
-            probe.embedding_available(),
+            probe.reasoning_available(),
             probe.load(),
             probe.queue_depth(),
             probe.upserted_units(),

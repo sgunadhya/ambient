@@ -10,49 +10,84 @@ use ambient_core::{
 use rig::client::{CompletionClient, EmbeddingsClient, Nothing};
 use rig::completion::Prompt;
 use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
-use rig::providers::ollama;
+use rig::providers::{ollama, openai};
 use tracing::{debug, info};
 use uuid::Uuid;
 
 pub struct RigReasoningEngine {
     pub backend: ReasoningBackend,
     ollama_client: Option<ollama::Client>,
+    openai_client: Option<openai::Client>,
     embedding_model_name: String,
     completion_model_name: String,
-    embedding_available: Arc<AtomicBool>,
+    reasoning_available: Arc<AtomicBool>,
 }
 
 impl RigReasoningEngine {
     pub fn new(backend: ReasoningBackend) -> Self {
-        let ollama_client = match &backend {
-            ReasoningBackend::Local { ollama_base_url } => ollama::Client::builder()
-                .api_key(Nothing)
-                .base_url(ollama_base_url)
-                .build()
-                .ok(),
-            ReasoningBackend::Remote { provider } => ollama::Client::builder()
-                .api_key(Nothing)
-                .base_url(provider)
-                .build()
-                .ok(),
+        let (ollama_client, openai_client) = match &backend {
+            ReasoningBackend::Local { ollama_base_url } => (
+                ollama::Client::builder()
+                    .api_key(Nothing)
+                    .base_url(ollama_base_url)
+                    .build()
+                    .ok(),
+                None,
+            ),
+            ReasoningBackend::OpenAI { base_url, api_key } => (
+                None,
+                openai::Client::builder()
+                    .api_key(api_key.as_deref().unwrap_or("lm-studio"))
+                    .base_url(base_url)
+                    .build()
+                    .ok(),
+            ),
+            ReasoningBackend::Remote { provider } => (
+                ollama::Client::builder()
+                    .api_key(Nothing)
+                    .base_url(provider)
+                    .build()
+                    .ok(),
+                None,
+            ),
         };
 
         Self {
             backend,
             ollama_client,
+            openai_client,
             embedding_model_name: ollama::NOMIC_EMBED_TEXT.to_string(),
             completion_model_name: ollama::LLAMA3_2.to_string(),
-            embedding_available: Arc::new(AtomicBool::new(true)),
+            reasoning_available: Arc::new(AtomicBool::new(true)),
         }
     }
 
+    pub fn with_embedding_model(mut self, model: String) -> Self {
+        self.embedding_model_name = model;
+        self
+    }
+
+    pub fn with_completion_model(mut self, model: String) -> Self {
+        self.completion_model_name = model;
+        self
+    }
+
     pub fn start_ollama_probe(&self) {
-        let available = Arc::clone(&self.embedding_available);
+        let available = Arc::clone(&self.reasoning_available);
         let backend = self.backend.clone();
         thread::spawn(move || loop {
             let ok = match &backend {
                 ReasoningBackend::Local { ollama_base_url } => {
                     let url = format!("{}/api/tags", ollama_base_url.trim_end_matches('/'));
+                    reqwest::blocking::Client::builder()
+                        .timeout(Duration::from_secs(3))
+                        .build()
+                        .ok()
+                        .and_then(|client| client.get(url).send().ok())
+                        .is_some_and(|resp| resp.status().is_success())
+                }
+                ReasoningBackend::OpenAI { base_url, .. } => {
+                    let url = format!("{}/models", base_url.trim_end_matches('/'));
                     reqwest::blocking::Client::builder()
                         .timeout(Duration::from_secs(3))
                         .build()
@@ -75,45 +110,70 @@ impl RigReasoningEngine {
         });
     }
 
-    pub fn embedding_available(&self) -> bool {
-        self.embedding_available.load(Ordering::Relaxed)
+    pub fn reasoning_available(&self) -> bool {
+        self.reasoning_available.load(Ordering::Relaxed)
     }
 }
 
 impl ReasoningEngine for RigReasoningEngine {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
-        debug!(text_len = text.len(), "requesting embedding from ollama");
-        if !self.embedding_available() {
-            return Err(CoreError::Unsupported("embedding backend unavailable"));
+        debug!(text_len = text.len(), "requesting embedding from backend");
+        if !self.reasoning_available() {
+            return Err(CoreError::Unsupported("reasoning backend unavailable"));
         }
-        let Some(client) = &self.ollama_client else {
-            return Err(CoreError::Unsupported("ollama client unavailable"));
-        };
-        let client = client.clone();
+
         let model_name = self.embedding_model_name.clone();
         let text = text.to_string();
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
-                .and_then(|rt| {
-                    rt.block_on(async move {
-                        let model = client.embedding_model_with_ndims(model_name, 768);
-                        let embedding = model
-                            .embed_text(&text)
-                            .await
-                            .map_err(|e| CoreError::Internal(format!("embedding failed: {e}")))?;
-                        Ok(embedding
-                            .vec
-                            .into_iter()
-                            .map(|v| v as f32)
-                            .collect::<Vec<f32>>())
-                    })
-                });
-            let _ = tx.send(result);
-        });
+
+        if let Some(client) = &self.ollama_client {
+            let client = client.clone();
+            thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
+                    .and_then(|rt| {
+                        rt.block_on(async move {
+                            let model = client.embedding_model_with_ndims(model_name, 768);
+                            let embedding = model.embed_text(&text).await.map_err(|e| {
+                                CoreError::Internal(format!("ollama embedding failed: {e}"))
+                            })?;
+                            Ok(embedding
+                                .vec
+                                .into_iter()
+                                .map(|v| v as f32)
+                                .collect::<Vec<f32>>())
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+        } else if let Some(client) = &self.openai_client {
+            let client = client.clone();
+            thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
+                    .and_then(|rt| {
+                        rt.block_on(async move {
+                            let model = client.embedding_model(model_name);
+                            let embedding = model.embed_text(&text).await.map_err(|e| {
+                                CoreError::Internal(format!("openai embedding failed: {e}"))
+                            })?;
+                            Ok(embedding
+                                .vec
+                                .into_iter()
+                                .map(|v| v as f32)
+                                .collect::<Vec<f32>>())
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+        } else {
+            return Err(CoreError::Unsupported("no reasoning client available"));
+        }
+
         rx.recv_timeout(Duration::from_secs(30))
             .map_err(|_| CoreError::Internal("embedding timed out after 30s".to_string()))?
     }
@@ -122,12 +182,8 @@ impl ReasoningEngine for RigReasoningEngine {
         info!(
             question = question,
             context_count = context.len(),
-            "requesting answer from ollama"
+            "requesting answer from backend"
         );
-        let Some(client) = &self.ollama_client else {
-            return Err(CoreError::Unsupported("ollama client unavailable"));
-        };
-        let client = client.clone();
         let model_name = self.completion_model_name.clone();
         let mut joined = String::new();
         for unit in context {
@@ -140,22 +196,45 @@ impl ReasoningEngine for RigReasoningEngine {
             "Use the context to answer the question.\nquestion: {question}\ncontext:{joined}"
         );
         let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
-                .and_then(|rt| {
-                    rt.block_on(async move {
-                        let agent = client.agent(model_name).build();
-                        agent
-                            .prompt(prompt)
-                            .await
-                            .map_err(|e| CoreError::Internal(format!("completion failed: {e}")))
-                    })
-                });
-            let _ = tx.send(result);
-        });
+
+        if let Some(client) = &self.ollama_client {
+            let client = client.clone();
+            thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
+                    .and_then(|rt| {
+                        rt.block_on(async move {
+                            let agent = client.agent(model_name).build();
+                            agent.prompt(prompt).await.map_err(|e| {
+                                CoreError::Internal(format!("ollama completion failed: {e}"))
+                            })
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+        } else if let Some(client) = &self.openai_client {
+            let client = client.clone();
+            thread::spawn(move || {
+                let result = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
+                    .and_then(|rt| {
+                        rt.block_on(async move {
+                            let agent = client.agent(model_name).build();
+                            agent.prompt(prompt).await.map_err(|e| {
+                                CoreError::Internal(format!("openai completion failed: {e}"))
+                            })
+                        })
+                    });
+                let _ = tx.send(result);
+            });
+        } else {
+            return Err(CoreError::Unsupported("no reasoning client available"));
+        }
+
         rx.recv_timeout(Duration::from_secs(60))
             .map_err(|_| CoreError::Internal("answer generation timed out after 60s".to_string()))?
     }

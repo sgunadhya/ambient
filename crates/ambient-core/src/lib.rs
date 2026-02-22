@@ -271,8 +271,16 @@ pub enum License {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ReasoningBackend {
-    Local { ollama_base_url: String },
-    Remote { provider: String },
+    Local {
+        ollama_base_url: String,
+    },
+    OpenAI {
+        base_url: String,
+        api_key: Option<String>,
+    },
+    Remote {
+        provider: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
