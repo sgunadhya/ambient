@@ -338,7 +338,7 @@ fn run() -> Result<(), String> {
             );
             let _ = triggers.start_watch(trigger_path);
             let report_dir = default_report_dir()?;
-            PatternScheduler::new(store.clone(), report_dir).start();
+            PatternScheduler::new(store.clone(), reasoning.clone(), report_dir).start();
 
             let mut active_sources = vec!["obsidian".to_string()];
             if config.spotlight {

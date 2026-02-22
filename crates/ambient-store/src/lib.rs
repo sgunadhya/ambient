@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use ambient_core::{
     derive_cognitive_state, CognitiveState, CoreError, FeedbackEvent, FeedbackSignal,
-    KnowledgeStore, KnowledgeUnit, PulseEvent, PulseSignal, Result,
+    KnowledgeStore, KnowledgeUnit, ProceduralRule, PulseEvent, PulseSignal, Result,
+    TemporalProfile,
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
@@ -155,6 +156,14 @@ impl CozoStore {
     hour_peak: Int,
     day_mask: Int,
     recency_weight: Float
+}
+:create procedural_rules {
+    id: String =>
+    lens_intent: <F32; 768>,
+    pulse_mask: String,
+    threshold: Float,
+    action_payload: Json,
+    created_at: Float
 }
 "#;
 
@@ -1188,6 +1197,182 @@ impl KnowledgeStore for CozoStore {
             .run_script(script, params, ScriptMutability::Mutable)
             .map(|_| ())
             .map_err(|e| CoreError::Internal(format!("temporal profiling failed: {e}")))
+    }
+
+    fn get_temporal_profile(&self, unit_id: Uuid) -> Result<Option<TemporalProfile>> {
+        let mut params = BTreeMap::new();
+        params.insert("unit_id".to_string(), DataValue::from(unit_id.to_string()));
+
+        let script = r#"
+?[unit_id, hour_peak, day_mask, recency_weight] :=
+    *temporal_profile{ unit_id: $unit_id, hour_peak, day_mask, recency_weight }
+"#;
+        let res = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to fetch temporal profile: {e}")))?;
+
+        if res.rows.is_empty() {
+            return Ok(None);
+        }
+
+        let row = &res.rows[0];
+        let hour_peak = match &row[1] {
+            DataValue::Num(cozo::Num::Int(i)) => *i as i8,
+            _ => -1,
+        };
+        let day_mask = match &row[2] {
+            DataValue::Num(cozo::Num::Int(i)) => *i as u8,
+            _ => 0,
+        };
+        let recency_weight = match &row[3] {
+            DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+            _ => 0.0,
+        };
+
+        Ok(Some(TemporalProfile {
+            unit_id,
+            hour_peak,
+            day_mask,
+            recency_weight,
+        }))
+    }
+
+    fn save_rule(&self, rule: ProceduralRule) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".to_string(), DataValue::from(rule.id.to_string()));
+        params.insert(
+            "lens_intent".to_string(),
+            DataValue::List(
+                rule.lens_intent
+                    .iter()
+                    .map(|f| DataValue::from(*f as f64))
+                    .collect(),
+            ),
+        );
+        params.insert(
+            "pulse_mask".to_string(),
+            DataValue::from(rule.pulse_mask.clone()),
+        );
+        params.insert(
+            "threshold".to_string(),
+            DataValue::from(rule.threshold as f64),
+        );
+        params.insert(
+            "action_payload".to_string(),
+            DataValue::Json(cozo::JsonData(rule.action_payload.clone())),
+        );
+        params.insert(
+            "created_at".to_string(),
+            DataValue::from(rule.created_at.timestamp_millis() as f64),
+        );
+
+        let script = r#"
+?[id, lens_intent, pulse_mask, threshold, action_payload, created_at] <- [[
+    $id, $lens_intent, $pulse_mask, $threshold, $action_payload, $created_at
+]]
+:put procedural_rules { id => lens_intent, pulse_mask, threshold, action_payload, created_at }
+"#;
+        self.cozo
+            .run_script(script, params, ScriptMutability::Mutable)
+            .map(|_| ())
+            .map_err(|e| CoreError::Internal(format!("failed to save rule: {e}")))
+    }
+
+    fn get_active_rules_for_pulse(&self, pulse_mask: &str) -> Result<Vec<ProceduralRule>> {
+        let mut params = BTreeMap::new();
+        params.insert("pulse_mask".to_string(), DataValue::from(pulse_mask));
+
+        let script = r#"
+?[id, lens_intent, pulse_mask, threshold, action_payload, created_at] :=
+    *procedural_rules{ id, lens_intent, pulse_mask: $pulse_mask, threshold, action_payload, created_at }
+"#;
+        let res = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to fetch rules: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in res.rows {
+            let id_str = match &row[0] {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            };
+            let id = Uuid::parse_str(&id_str).unwrap_or_default();
+            let lens_intent = match &row[1] {
+                DataValue::List(l) => l
+                    .iter()
+                    .map(|v| match v {
+                        DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+                        _ => 0.0,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            let pulse_mask = match &row[2] {
+                DataValue::Str(s) => s.to_string(),
+                _ => String::new(),
+            };
+            let threshold = match &row[3] {
+                DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+                _ => 0.0,
+            };
+            let action_payload = match &row[4] {
+                DataValue::Json(j) => j.0.clone(),
+                _ => serde_json::Value::Null,
+            };
+            let created_at_ms = match &row[5] {
+                DataValue::Num(cozo::Num::Float(f)) => *f as i64,
+                DataValue::Num(cozo::Num::Int(i)) => *i,
+                _ => 0,
+            };
+            let created_at =
+                DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
+
+            out.push(ProceduralRule {
+                id,
+                lens_intent,
+                pulse_mask,
+                threshold,
+                action_payload,
+                created_at,
+            });
+        }
+        Ok(out)
+    }
+
+    fn get_all_lens_vectors(&self, lens_id: &str) -> Result<Vec<(Uuid, Vec<f32>)>> {
+        let mut params = BTreeMap::new();
+        params.insert("lens_id".to_string(), DataValue::from(lens_id));
+
+        let script = r#"
+?[unit_id, vec] := *lens_map{ unit_id, lens_id: $lens_id, vec }
+"#;
+        let res = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to export lens vectors: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in res.rows {
+            let id_str = match &row[0] {
+                DataValue::Str(s) => s.as_str(),
+                _ => "",
+            };
+            let id = Uuid::parse_str(id_str).unwrap_or_default();
+            let vec = match &row[1] {
+                DataValue::List(l) => l
+                    .iter()
+                    .map(|v| match v {
+                        DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+                        _ => 0.0,
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
+            out.push((id, vec));
+        }
+        Ok(out)
     }
 }
 

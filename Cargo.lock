@@ -184,6 +184,10 @@ dependencies = [
  "blake3",
  "chrono",
  "cozo",
+ "ndarray 0.17.2",
+ "petal-clustering",
+ "petal-neighbors",
+ "serde_json",
  "uuid",
 ]
 
@@ -194,6 +198,7 @@ dependencies = [
  "ambient-core",
  "ambient-reasoning",
  "ambient-store",
+ "chrono",
 ]
 
 [[package]]
@@ -613,7 +618,7 @@ dependencies = [
  "bitflags 2.11.0",
  "cexpr",
  "clang-sys",
- "itertools",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "regex",
@@ -956,13 +961,13 @@ dependencies = [
  "env_logger",
  "fast2s",
  "graph",
- "itertools",
+ "itertools 0.12.1",
  "jieba-rs",
  "lazy_static",
  "log",
  "miette",
  "minreq",
- "ndarray",
+ "ndarray 0.15.6",
  "num-traits",
  "ordered-float 4.6.0",
  "pest",
@@ -2057,6 +2062,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "itertools"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2b192c782037fadd9cfa75548310488aabdbf3d2da73885b31bd0abd03351285"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2453,6 +2467,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ndarray"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "520080814a7a6b4a6e9070823bb24b4531daac8c4627e08ba5de8c5ef2f2752d"
+dependencies = [
+ "matrixmultiply",
+ "num-complex",
+ "num-integer",
+ "num-traits",
+ "portable-atomic",
+ "portable-atomic-util",
+ "rawpointer",
+]
+
+[[package]]
 name = "nom"
 version = "7.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2803,6 +2832,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "petal-clustering"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "65c8e67a7465f5f3b14fc47c99dfe154a6de9c29a96a908ecff40dfdbe5bc3c6"
+dependencies = [
+ "itertools 0.14.0",
+ "ndarray 0.17.2",
+ "num-traits",
+ "petal-neighbors",
+ "rayon",
+ "serde",
+ "succinct",
+]
+
+[[package]]
+name = "petal-neighbors"
+version = "0.18.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "16fd9983c4b760302fe9cee8ad204ee6555ed967df8fab30974138a001026c91"
+dependencies = [
+ "ndarray 0.17.2",
+ "num-traits",
+ "ordered-float 5.1.0",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "petgraph"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2890,6 +2946,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 
 [[package]]
+name = "portable-atomic"
+version = "1.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c33a9471896f1c69cecef8d20cbe2f7accd12527ce60845ff44c153bb2a21b49"
+
+[[package]]
+name = "portable-atomic-util"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a9db96d7fa8782dd8c15ce32ffe8680bbd1e978a43bf51a34d39483540495f5"
+dependencies = [
+ "portable-atomic",
+]
+
+[[package]]
 name = "potential_utf"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2953,7 +3024,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools",
+ "itertools 0.12.1",
  "log",
  "multimap",
  "petgraph",
@@ -2972,7 +3043,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools",
+ "itertools 0.12.1",
  "proc-macro2",
  "quote",
  "syn 2.0.117",
@@ -3880,6 +3951,16 @@ name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
+
+[[package]]
+name = "succinct"
+version = "0.5.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7798b62081a999bcf090b2f220fee8845dd1c6ffeb17e1bc6ca783825f62a418"
+dependencies = [
+ "byteorder",
+ "num-traits",
+]
 
 [[package]]
 name = "supports-color"

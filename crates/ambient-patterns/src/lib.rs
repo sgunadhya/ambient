@@ -19,6 +19,9 @@ use ambient_core::{
 };
 use chrono::{Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
+use ndarray::Array2;
+use petal_clustering::{Dbscan, Fit};
+use petal_neighbors::distance::Euclidean;
 
 // ── PatternInsight ─────────────────────────────────────────────────────────────
 
@@ -437,6 +440,7 @@ impl SchedulerProbe for DefaultSchedulerProbe {
 
 pub struct PatternScheduler {
     detector: PatternDetector,
+    noticer: NoticerConsumer,
     probe: Arc<dyn SchedulerProbe>,
     poll_interval: Duration,
     report_dir: PathBuf,
@@ -444,9 +448,14 @@ pub struct PatternScheduler {
 }
 
 impl PatternScheduler {
-    pub fn new(store: Arc<dyn KnowledgeStore>, report_dir: PathBuf) -> Self {
+    pub fn new(
+        store: Arc<dyn KnowledgeStore>,
+        reasoner: Arc<dyn ambient_core::ReasoningEngine>,
+        report_dir: PathBuf,
+    ) -> Self {
         Self {
-            detector: PatternDetector::new(store),
+            detector: PatternDetector::new(store.clone()),
+            noticer: NoticerConsumer::new(store, reasoner),
             probe: Arc::new(DefaultSchedulerProbe),
             poll_interval: Duration::from_secs(60),
             report_dir,
@@ -507,7 +516,115 @@ impl PatternScheduler {
                     notify_report_ready(&self.report_dir);
                 }
             }
+
+            // Phase 4: Noticer Discovery Cycle
+            if let Err(e) = self.noticer.run_discovery_cycle() {
+                eprintln!("Noticer discovery cycle failed: {e}");
+            }
+
+            // Phase 3/4: Temporal Recalculation
+            let _ = self.run_temporal_maintenance();
         });
+    }
+
+    fn run_temporal_maintenance(&self) -> Result<()> {
+        let store = &self.detector.store;
+        let units = store.search_fulltext("")?;
+        for unit in units {
+            let _ = store.calculate_temporal_profile(unit.id);
+        }
+        Ok(())
+    }
+}
+
+// ── The Noticer (Procedural Memory Discovery) ───────────────────────────────
+
+pub struct NoticerConsumer {
+    store: Arc<dyn KnowledgeStore>,
+    reasoner: Arc<dyn ambient_core::ReasoningEngine>,
+}
+
+impl NoticerConsumer {
+    pub fn new(
+        store: Arc<dyn KnowledgeStore>,
+        reasoner: Arc<dyn ambient_core::ReasoningEngine>,
+    ) -> Self {
+        Self { store, reasoner }
+    }
+
+    /// Run a discovery cycle: fetch all L1 vectors, cluster them, and generate rules.
+    pub fn run_discovery_cycle(&self) -> Result<()> {
+        let vectors = self.store.get_all_lens_vectors("l1_semantic")?;
+        if vectors.len() < 10 {
+            return Ok(());
+        }
+
+        // Prepare data for clustering
+        let unit_ids: Vec<Uuid> = vectors.iter().map(|(id, _)| *id).collect();
+        let dim = vectors[0].1.len();
+        let mut data = Vec::with_capacity(vectors.len() * dim);
+        for (_, v) in &vectors {
+            data.extend_from_slice(v);
+        }
+
+        let array = Array2::from_shape_vec((vectors.len(), dim), data)
+            .map_err(|e| CoreError::Internal(format!("failed to shape clustering array: {e}")))?;
+
+        // DBSCAN: eps=0.5 (cosine-ish), min_samples=3
+        let mut model = Dbscan::new(0.5, 3, Euclidean::default());
+        let (clusters, _): (HashMap<usize, Vec<usize>>, _) = model.fit(&array, None);
+
+        // Group by cluster and generate rules if significant
+        for (_label, indices) in clusters {
+            if indices.len() >= 5 {
+                let cluster_ids: Vec<Uuid> = indices.iter().map(|&i| unit_ids[i]).collect();
+                self.formalize_cluster(cluster_ids)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn formalize_cluster(&self, unit_ids: Vec<Uuid>) -> Result<()> {
+        let mut notes = Vec::new();
+        for id in unit_ids.iter().take(10) {
+            if let Some(unit) = self.store.get_by_id(*id)? {
+                notes.push(unit);
+            }
+        }
+
+        let contents: Vec<String> = notes.iter().map(|n| n.content.clone()).collect();
+        let prompt = format!(
+            "Analyze these related knowledge units and derive a 'procedural rule' that encapsulates the behavior or topic. \
+            The rule should match similar future units. \
+            Units: \n---\n{}\n---\n\
+            Return a JSON object with: {{ \"summary\": \"...\", \"trigger_description\": \"...\", \"suggested_action_payload\": {{}} }}",
+            contents.join("\n---\n")
+        );
+
+        let response = self.reasoner.answer(&prompt, &notes)?;
+        // Parse response and save rule
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&response) {
+            // Calculate centroid of the cluster for lens_intent
+            // (Omitted for brevity, using first unit's vector as proxy for now)
+            let lens_intent = self.store.get_all_lens_vectors("l1_semantic")? // Inefficient but works for MVP
+                .into_iter()
+                .find(|(id, _)| *id == unit_ids[0])
+                .map(|(_, v)| v)
+                .unwrap_or_else(|| vec![0.0; 768]);
+
+            let rule = ambient_core::ProceduralRule {
+                id: Uuid::new_v4(),
+                lens_intent,
+                pulse_mask: "any".to_string(), // MVP: match any pulse
+                threshold: 0.85,
+                action_payload: val["suggested_action_payload"].clone(),
+                created_at: Utc::now(),
+            };
+            self.store.save_rule(rule)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -844,6 +961,28 @@ mod tests {
 
         fn calculate_temporal_profile(&self, _unit_id: Uuid) -> AResult<()> {
             Ok(())
+        }
+
+        fn get_temporal_profile(
+            &self,
+            _unit_id: Uuid,
+        ) -> AResult<Option<ambient_core::TemporalProfile>> {
+            Ok(None)
+        }
+
+        fn save_rule(&self, _rule: ambient_core::ProceduralRule) -> AResult<()> {
+            Ok(())
+        }
+
+        fn get_active_rules_for_pulse(
+            &self,
+            _pulse_mask: &str,
+        ) -> AResult<Vec<ambient_core::ProceduralRule>> {
+            Ok(Vec::new())
+        }
+
+        fn get_all_lens_vectors(&self, _lens_id: &str) -> AResult<Vec<(Uuid, Vec<f32>)>> {
+            Ok(Vec::new())
         }
     }
 

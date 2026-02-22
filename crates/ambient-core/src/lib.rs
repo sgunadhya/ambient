@@ -13,6 +13,24 @@ pub use uuid::Uuid;
 
 pub type Result<T> = std::result::Result<T, CoreError>;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemporalProfile {
+    pub unit_id: Uuid,
+    pub hour_peak: i8, // -1 to 23
+    pub day_mask: u8,  // bitmask for Mon-Sun
+    pub recency_weight: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProceduralRule {
+    pub id: Uuid,
+    pub lens_intent: Vec<f32>, // Centroid in L1 space
+    pub pulse_mask: String,    // Datalog bitmask or pattern
+    pub threshold: f32,        // Cosine similarity threshold
+    pub action_payload: serde_json::Value,
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Error)]
 pub enum CoreError {
     #[error("unsupported operation: {0}")]
@@ -181,6 +199,17 @@ pub struct QueryRequest {
     pub k: usize,
     pub include_pulse_context: bool,
     pub context_window_secs: Option<u64>,
+}
+
+impl Default for QueryRequest {
+    fn default() -> Self {
+        Self {
+            text: String::new(),
+            k: 10,
+            include_pulse_context: false,
+            context_window_secs: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -396,8 +425,15 @@ pub trait KnowledgeStore: Send + Sync {
     fn search_lens(&self, lens_id: &str, query_vec: &[f32], k: usize)
         -> Result<Vec<KnowledgeUnit>>;
 
+    fn save_rule(&self, rule: ProceduralRule) -> Result<()>;
+    fn get_active_rules_for_pulse(&self, pulse_mask: &str) -> Result<Vec<ProceduralRule>>;
+
     /// Re-calculate and update the temporal profiles for units based on pulse history.
     fn calculate_temporal_profile(&self, unit_id: Uuid) -> Result<()>;
+    fn get_temporal_profile(&self, unit_id: Uuid) -> Result<Option<TemporalProfile>>;
+
+    /// Batch retrieval of lens vectors for clustering.
+    fn get_all_lens_vectors(&self, lens_id: &str) -> Result<Vec<(Uuid, Vec<f32>)>>;
 }
 
 pub trait ReasoningEngine: Send + Sync {
@@ -881,6 +917,25 @@ pub mod mocks {
 
         fn calculate_temporal_profile(&self, _unit_id: Uuid) -> Result<()> {
             Ok(())
+        }
+
+        fn get_temporal_profile(&self, _unit_id: Uuid) -> Result<Option<crate::TemporalProfile>> {
+            Ok(None)
+        }
+
+        fn save_rule(&self, _rule: crate::ProceduralRule) -> Result<()> {
+            Ok(())
+        }
+
+        fn get_active_rules_for_pulse(
+            &self,
+            _pulse_mask: &str,
+        ) -> Result<Vec<crate::ProceduralRule>> {
+            Ok(Vec::new())
+        }
+
+        fn get_all_lens_vectors(&self, _lens_id: &str) -> Result<Vec<(Uuid, Vec<f32>)>> {
+            Ok(Vec::new())
         }
     }
 
