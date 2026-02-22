@@ -11,6 +11,7 @@ use rig::client::{CompletionClient, EmbeddingsClient, Nothing};
 use rig::completion::Prompt;
 use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
 use rig::providers::ollama;
+use tracing::{debug, info};
 use uuid::Uuid;
 
 pub struct RigReasoningEngine {
@@ -81,6 +82,7 @@ impl RigReasoningEngine {
 
 impl ReasoningEngine for RigReasoningEngine {
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
+        debug!(text_len = text.len(), "requesting embedding from ollama");
         if !self.embedding_available() {
             return Err(CoreError::Unsupported("embedding backend unavailable"));
         }
@@ -103,7 +105,11 @@ impl ReasoningEngine for RigReasoningEngine {
                             .embed_text(&text)
                             .await
                             .map_err(|e| CoreError::Internal(format!("embedding failed: {e}")))?;
-                        Ok(embedding.vec.into_iter().map(|v| v as f32).collect::<Vec<f32>>())
+                        Ok(embedding
+                            .vec
+                            .into_iter()
+                            .map(|v| v as f32)
+                            .collect::<Vec<f32>>())
                     })
                 });
             let _ = tx.send(result);
@@ -113,6 +119,11 @@ impl ReasoningEngine for RigReasoningEngine {
     }
 
     fn answer(&self, question: &str, context: &[KnowledgeUnit]) -> Result<String> {
+        info!(
+            question = question,
+            context_count = context.len(),
+            "requesting answer from ollama"
+        );
         let Some(client) = &self.ollama_client else {
             return Err(CoreError::Unsupported("ollama client unavailable"));
         };
@@ -185,6 +196,8 @@ impl EmbeddingQueue {
                 let Ok((id, text)) = job else {
                     return;
                 };
+
+                debug!(unit_id = %id, "processing background embedding job");
 
                 if let Ok(mut depth) = worker_depth.lock() {
                     *depth = depth.saturating_sub(1);
