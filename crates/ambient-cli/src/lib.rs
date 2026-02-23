@@ -242,10 +242,11 @@ impl PulseConsumer {
                             } => {
                                 recorder.on_context_switch_spike(switches_per_minute);
                             }
-                            PulseSignal::ActiveApp { window_title, .. } => {
-                                if let Some(title) = window_title {
-                                    recorder.on_file_opened(&title);
-                                }
+                            PulseSignal::ActiveApp {
+                                window_title: Some(title),
+                                ..
+                            } => {
+                                recorder.on_file_opened(&title);
                             }
                             _ => {}
                         }

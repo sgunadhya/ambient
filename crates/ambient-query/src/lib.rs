@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use ambient_core::{
     CapabilityGate, CapabilityStatus, CoreError, GatedCapability, KnowledgeStore, LensConfig,
-    LensId, LensIndexStore, LensRetriever, QueryEngine, QueryRequest, QueryResult, ReasoningEngine,
-    Result, Uuid,
+    LensIndexStore, LensRetriever, QueryEngine, QueryRequest, QueryResult, ReasoningEngine, Result,
+    Uuid,
 };
 use ambient_store::CozoStore;
 use chrono::{Datelike, Timelike};
@@ -257,13 +257,15 @@ impl QueryEngine for AmbientQueryEngine {
     }
 }
 
-pub fn build_runtime_components(
-    reasoning: Option<Arc<dyn ReasoningEngine>>,
-) -> Result<(
+pub type RuntimeComponents = (
     Arc<dyn QueryEngine>,
     Arc<dyn KnowledgeStore>,
     Arc<dyn LensIndexStore>,
-)> {
+);
+
+pub fn build_runtime_components(
+    reasoning: Option<Arc<dyn ReasoningEngine>>,
+) -> Result<RuntimeComponents> {
     build_runtime_components_with_weights(0.7, 0.3, reasoning)
 }
 
@@ -271,11 +273,7 @@ pub fn build_runtime_components_with_weights(
     semantic_weight: f32,
     feedback_weight: f32,
     reasoning: Option<Arc<dyn ReasoningEngine>>,
-) -> Result<(
-    Arc<dyn QueryEngine>,
-    Arc<dyn KnowledgeStore>,
-    Arc<dyn LensIndexStore>,
-)> {
+) -> Result<RuntimeComponents> {
     let cozo = Arc::new(CozoStore::new()?);
     let store: Arc<dyn KnowledgeStore> = cozo.clone();
     let index_store: Arc<dyn LensIndexStore> = cozo;

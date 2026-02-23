@@ -6,7 +6,7 @@ use std::time::Duration;
 use ambient_core::{
     CoreError, EventLogEntry, KnowledgeConsumer, KnowledgeStore, KnowledgeUnit, LensConfig, LensId,
     LensIndexStore, LoadAware, RawPayload, ReasoningBackend, ReasoningEngine, Result,
-    StreamProvider, SystemLoad, Uuid,
+    StreamProvider, SystemLoad,
 };
 use ambient_lenses::{LensRouter, MultiLensRouter};
 use rig::client::{CompletionClient, EmbeddingsClient, Nothing};

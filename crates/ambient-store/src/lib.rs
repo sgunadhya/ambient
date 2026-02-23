@@ -613,7 +613,7 @@ impl CozoStore {
                             if let (
                                 Some(DataValue::Str(id_str)),
                                 Some(DataValue::Str(note_title)),
-                            ) = (row.get(0), row.get(1))
+                            ) = (row.first(), row.get(1))
                             {
                                 // Match the extracted link target against the title (fuzzy match)
                                 let link_title_str = link_title.as_str();
@@ -707,7 +707,7 @@ impl CozoStore {
     }
 
     fn row_to_procedural_rule(&self, row: &[DataValue]) -> Option<ProceduralRule> {
-        let id_str = match row.get(0) {
+        let id_str = match row.first() {
             Some(DataValue::Str(s)) => s.to_string(),
             _ => return None,
         };
@@ -837,7 +837,7 @@ impl KnowledgeStore for CozoStore {
                 .run_script(query, params, ScriptMutability::Immutable)
             {
                 if let Some(row) = result.rows.first() {
-                    if let Some(DataValue::Str(existing_id_str)) = row.get(0) {
+                    if let Some(DataValue::Str(existing_id_str)) = row.first() {
                         if let Ok(existing_id) = Uuid::parse_str(existing_id_str) {
                             if existing_id != unit.id {
                                 return Ok(());
@@ -975,18 +975,14 @@ impl KnowledgeStore for CozoStore {
     ~notes:fts{ id, source, title, content, hash, observed_at, metadata | query: $query, k: $k }
 "#;
         let mut out = Vec::new();
-        match self
+        if let Ok(result) = self
             .cozo
-            .run_script(script, params, ScriptMutability::Immutable)
-        {
-            Ok(result) => {
-                for row in result.rows {
-                    if let Some(unit) = self.row_to_knowledge_unit(&row) {
-                        out.push(unit);
-                    }
+            .run_script(script, params, ScriptMutability::Immutable) {
+            for row in result.rows {
+                if let Some(unit) = self.row_to_knowledge_unit(&row) {
+                    out.push(unit);
                 }
             }
-            Err(_) => {}
         }
         Ok(out)
     }
@@ -1458,7 +1454,7 @@ impl KnowledgeStore for CozoStore {
         let mut out = Vec::new();
         for row in res.rows {
             if let (Some(DataValue::Str(id_s)), Some(state)) =
-                (row.get(0), self.row_to_cognitive_state(&row))
+                (row.first(), self.row_to_cognitive_state(&row))
             {
                 if let Ok(id) = Uuid::parse_str(id_s.as_str()) {
                     out.push((id, state));

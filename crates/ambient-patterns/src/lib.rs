@@ -44,8 +44,7 @@ impl ActionPredictor {
             let pulse_match = if rule.pulse_mask.is_empty() {
                 true
             } else {
-                snapshots
-                    .get(0)
+                snapshots.first()
                     .map(|(_, s)| s.dominant_app.as_deref() == Some(&rule.pulse_mask))
                     .unwrap_or(false)
             };
