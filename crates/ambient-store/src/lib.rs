@@ -1,12 +1,11 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::time::Duration;
 
 use ambient_core::{
     derive_cognitive_state, CognitiveState, CoreError, FeedbackEvent, FeedbackSignal,
-    KnowledgeStore, KnowledgeUnit, ProceduralRule, PulseEvent, PulseSignal, Result,
-    TemporalProfile,
+    KnowledgeStore, KnowledgeUnit, LensConfig, LensIndexStore, ProceduralRule, PulseEvent,
+    PulseSignal, Result, TemporalProfile,
 };
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
@@ -25,11 +24,6 @@ const METRIC_SLEEP_QUALITY: &str = "sleep_quality";
 
 pub struct CozoStore {
     cozo: DbInstance,
-    units: Mutex<HashMap<Uuid, KnowledgeUnit>>,
-    hash_index: Mutex<HashMap<[u8; 32], Uuid>>,
-    links: Mutex<HashMap<Uuid, HashSet<Uuid>>>,
-    snapshots: Mutex<HashMap<Uuid, CognitiveState>>,
-    feedback: Mutex<Vec<FeedbackEvent>>,
     pulse_storage: tsink::Storage,
 }
 
@@ -50,11 +44,6 @@ impl CozoStore {
 
         let store = Self {
             cozo,
-            units: Mutex::new(HashMap::new()),
-            hash_index: Mutex::new(HashMap::new()),
-            links: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(HashMap::new()),
-            feedback: Mutex::new(Vec::new()),
             pulse_storage,
         };
         store.init_cozo_schema();
@@ -81,11 +70,6 @@ impl CozoStore {
 
         let store = Self {
             cozo,
-            units: Mutex::new(HashMap::new()),
-            hash_index: Mutex::new(HashMap::new()),
-            links: Mutex::new(HashMap::new()),
-            snapshots: Mutex::new(HashMap::new()),
-            feedback: Mutex::new(Vec::new()),
             pulse_storage,
         };
         store.init_cozo_schema();
@@ -93,83 +77,38 @@ impl CozoStore {
     }
 
     fn init_cozo_schema(&self) {
-        let schema = r#"
-:create notes {
-    id: String =>
-    source: String,
-    title: String,
-    content: String,
-    hash: String,
-    observed_at: Float
-}
-:create links {
-    from_id: String,
-    to_id: String =>
-    link_type: String
-}
-:create pattern_results {
-    id: String =>
-    pattern_type: String,
-    summary: String,
-    unit_ids: [String],
-    detected_at: Float,
-    feedback: String?
-}
-:create feedback_events {
-    id: String =>
-    timestamp: Float,
-    signal_type: String,
-    unit_id: String?,
-    query_text: String?,
-    action: String?,
-    pattern_id: String?
-}
-:create cognitive_snapshots {
-    unit_id: String =>
-    observed_at: Float,
-    window_secs: Int,
-    was_in_flow: Bool,
-    was_on_call: Bool,
-    dominant_app: String?,
-    time_of_day: Int,
-    context_switch_rate: Float,
-    was_in_meeting: Bool,
-    was_in_focus_block: Bool,
-    energy_level: Int?,
-    mood_level: Int?,
-    hrv_score: Float?,
-    sleep_quality: Float?,
-    minutes_since_last_meeting: Int?
-}
-:create lens_map {
-    unit_id: String,
-    lens_id: String =>
-    vec: <F32; 768>?
-}
-:create lens_map_384 {
-    unit_id: String,
-    lens_id: String =>
-    vec: <F32; 384>?
-}
-:create temporal_profile {
-    unit_id: String =>
-    hour_peak: Int,
-    day_mask: Int,
-    recency_weight: Float
-}
-:create procedural_rules {
-    id: String =>
-    lens_intent: <F32; 768>,
-    pulse_mask: String,
-    threshold: Float,
-    action_payload: Json,
-    created_at: Float
-}
-"#;
+        let commands = [
+            ":create notes { id: String => source: String, title: String, content: String, hash: String, observed_at: Float, metadata: Json }",
+            ":create links { from_id: String, to_id: String => link_type: String }",
+            ":create pattern_results { id: String => pattern_type: String, summary: String, unit_ids: Json, detected_at: Float, feedback: String? }",
+            ":create feedback_events { id: String => timestamp: Float, signal_type: String, unit_id: String?, query_text: String?, action: String?, pattern_id: String? }",
+            ":create cognitive_snapshots { unit_id: String => observed_at: Float, window_secs: Int, was_in_flow: Bool, was_on_call: Bool, dominant_app: String?, time_of_day: Int, context_switch_rate: Float, was_in_meeting: Bool, was_in_focus_block: Bool, energy_level: Int?, mood_level: Int?, hrv_score: Float?, sleep_quality: Float?, minutes_since_last_meeting: Int? }",
+            ":create lens_map { unit_id: String, lens_id: String => vec: <F32; 768>? }",
+            ":create lens_map_384 { unit_id: String, lens_id: String => vec: <F32; 384>? }",
+            ":create temporal_profile { unit_id: String => hour_peak: Int, day_mask: Int, recency_weight: Float }",
+            ":create procedural_rules { id: String => lens_intent: <F32; 768>, pulse_mask: String, threshold: Float, action_payload: Json, created_at: Float }",
+        ];
 
-        let _ = self
-            .cozo
-            .run_script(schema, BTreeMap::new(), ScriptMutability::Mutable);
+        for cmd in commands {
+            let res = self
+                .cozo
+                .run_script(cmd, BTreeMap::new(), ScriptMutability::Mutable);
+
+            if let Err(e) = res {
+                // Ignore "conflicts with an existing one" which is normal if table exists
+                let err_str = e.to_string();
+                if !err_str.contains("conflicts with an existing one") {
+                    println!("Failed to run script: {}. Error: {}", cmd, e);
+                }
+            }
+        }
+
+        // Secondary Index for feedback_events
+        let _ = self.cozo.run_script(
+            ":create index feedback_events { unit_id }",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        );
 
         // HNSW Vector Index for the lens_map table (L1/L2 at 768D)
         let hnsw_768_schema = r#"
@@ -204,13 +143,19 @@ impl CozoStore {
         // FTS Setup
         let fts_schema = r#"
 ::fts create notes:fts {
-    fields: [title, content],
-    filters: {language: English}
+    extractor: concat(title, concat(" ___ ", content)),
+    tokenizer: Simple
 }
 "#;
-        let _ = self
+        if let Err(e) = self
             .cozo
-            .run_script(fts_schema, BTreeMap::new(), ScriptMutability::Mutable);
+            .run_script(fts_schema, BTreeMap::new(), ScriptMutability::Mutable)
+        {
+            let err_str = e.to_string();
+            if !err_str.contains("conflicts with an existing one") {
+                eprintln!("FTS schema init error: {}", e);
+            }
+        }
     }
 
     fn cozo_put_note(&self, unit: &KnowledgeUnit) {
@@ -230,16 +175,25 @@ impl CozoStore {
             "observed_at".to_string(),
             DataValue::from(unit.observed_at.timestamp_millis() as f64),
         );
+        params.insert(
+            "metadata_str".to_string(),
+            DataValue::from(
+                serde_json::to_string(&unit.metadata).unwrap_or_else(|_| "{}".to_string()),
+            ),
+        );
 
         let script = r#"
-?[id, source, title, content, hash, observed_at] <- [[
-    $id, $source, $title, $content, $hash, $observed_at
+?[id, source, title, content, hash, observed_at, metadata] <- [[
+    $id, $source, $title, $content, $hash, $observed_at, parse_json($metadata_str)
 ]]
-:put notes { id => source, title, content, hash, observed_at }
+:put notes { id => source, title, content, hash, observed_at, metadata }
 "#;
-        let _ = self
+        if let Err(e) = self
             .cozo
-            .run_script(script, params, ScriptMutability::Mutable);
+            .run_script(script, params, ScriptMutability::Mutable)
+        {
+            eprintln!("Error in cozo_put_note Datalog: {}", e);
+        }
     }
 
     fn cozo_put_link(&self, from_id: Uuid, to_id: Uuid) {
@@ -646,36 +600,38 @@ impl CozoStore {
     }
 
     fn index_links(&self, unit: &KnowledgeUnit) -> Result<()> {
-        let mut title_to_id = HashMap::new();
-        {
-            let guard = self
-                .units
-                .lock()
-                .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?;
-            for existing in guard.values() {
-                if let Some(title) = &existing.title {
-                    title_to_id.insert(title.clone(), existing.id);
-                }
-            }
-        }
-
-        let mut edges = HashSet::new();
         if let Some(Value::Array(links)) = unit.metadata.get("links") {
             for link in links {
                 if let Value::String(link_title) = link {
-                    if let Some(target) = title_to_id.get(link_title) {
-                        edges.insert(*target);
-                        self.cozo_put_link(unit.id, *target);
+                    // Fetch all notes' IDs and titles to do in-memory fuzzy matching
+                    let query = r#"?[id, title] := *notes{id, title}"#;
+                    if let Ok(result) =
+                        self.cozo
+                            .run_script(query, BTreeMap::new(), ScriptMutability::Immutable)
+                    {
+                        for row in result.rows {
+                            if let (
+                                Some(DataValue::Str(id_str)),
+                                Some(DataValue::Str(note_title)),
+                            ) = (row.get(0), row.get(1))
+                            {
+                                // Match the extracted link target against the title (fuzzy match)
+                                let link_title_str = link_title.as_str();
+                                let note_title_str = note_title.as_str();
+
+                                if note_title_str.contains(link_title_str)
+                                    || link_title_str.contains(note_title_str)
+                                {
+                                    if let Ok(target_id) = Uuid::parse_str(id_str) {
+                                        self.cozo_put_link(unit.id, target_id);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
         }
-
-        self.links
-            .lock()
-            .map_err(|_| CoreError::Internal("links lock poisoned".to_string()))?
-            .insert(unit.id, edges);
-
         Ok(())
     }
 }
@@ -685,7 +641,7 @@ impl CozoStore {
     /// Decode a CozoDB result row `[id, source, title, content, hash, observed_at, ...]`
     /// into a `KnowledgeUnit`. The optional trailing column (dist / score) is ignored.
     fn row_to_knowledge_unit(&self, row: &[DataValue]) -> Option<KnowledgeUnit> {
-        if row.len() < 6 {
+        if row.len() < 7 {
             return None;
         }
         let id_str = match &row[0] {
@@ -724,6 +680,21 @@ impl CozoStore {
         };
         let observed_at = chrono::DateTime::from_timestamp_millis(observed_at_ms)?;
 
+        let metadata = match &row[6] {
+            DataValue::Json(val) => {
+                if let serde_json::Value::Object(map) = &val.0 {
+                    let mut res = std::collections::HashMap::new();
+                    for (k, v) in map {
+                        res.insert(k.clone(), v.clone());
+                    }
+                    res
+                } else {
+                    std::collections::HashMap::new()
+                }
+            }
+            _ => std::collections::HashMap::new(),
+        };
+
         Some(KnowledgeUnit {
             id,
             source,
@@ -731,7 +702,121 @@ impl CozoStore {
             content,
             content_hash,
             observed_at,
-            metadata: std::collections::HashMap::new(),
+            metadata,
+        })
+    }
+
+    fn row_to_procedural_rule(&self, row: &[DataValue]) -> Option<ProceduralRule> {
+        let id_str = match row.get(0) {
+            Some(DataValue::Str(s)) => s.to_string(),
+            _ => return None,
+        };
+        let id = Uuid::parse_str(&id_str).ok()?;
+
+        let lens_intent = match row.get(1) {
+            Some(DataValue::List(l)) => l
+                .iter()
+                .map(|v| match v {
+                    DataValue::Num(cozo::Num::Float(f)) => *f as f32,
+                    DataValue::Num(cozo::Num::Int(i)) => *i as f32,
+                    _ => 0.0,
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
+
+        let pulse_mask = match row.get(2) {
+            Some(DataValue::Str(s)) => s.to_string(),
+            _ => return None,
+        };
+
+        let threshold = match row.get(3) {
+            Some(DataValue::Num(cozo::Num::Float(f))) => *f as f32,
+            Some(DataValue::Num(cozo::Num::Int(i))) => *i as f32,
+            _ => 0.0,
+        };
+
+        let action_payload = match row.get(4) {
+            Some(DataValue::Json(j)) => j.0.clone(),
+            _ => serde_json::Value::Null,
+        };
+
+        let created_at_ms = match row.get(5) {
+            Some(DataValue::Num(cozo::Num::Float(f))) => *f as i64,
+            Some(DataValue::Num(cozo::Num::Int(i))) => *i,
+            _ => 0,
+        };
+        let created_at = DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
+
+        Some(ProceduralRule {
+            id,
+            lens_intent,
+            pulse_mask,
+            threshold,
+            action_payload,
+            created_at,
+        })
+    }
+
+    fn row_to_cognitive_state(&self, row: &[DataValue]) -> Option<CognitiveState> {
+        // unit_id is row[0], observed_at is row[1], ...
+        let was_in_flow = match row.get(3) {
+            Some(DataValue::Bool(b)) => *b,
+            _ => false,
+        };
+        let was_on_call = match row.get(4) {
+            Some(DataValue::Bool(b)) => *b,
+            _ => false,
+        };
+        let dominant_app = match row.get(5) {
+            Some(DataValue::Str(s)) => Some(s.to_string()),
+            _ => None,
+        };
+        let time_of_day = match row.get(6) {
+            Some(DataValue::Num(cozo::Num::Int(i))) => Some(*i as u8),
+            _ => None,
+        };
+        let was_in_meeting = match row.get(8) {
+            Some(DataValue::Bool(b)) => *b,
+            _ => false,
+        };
+        let was_in_focus_block = match row.get(9) {
+            Some(DataValue::Bool(b)) => *b,
+            _ => false,
+        };
+        let energy_level = match row.get(10) {
+            Some(DataValue::Num(cozo::Num::Int(i))) => Some(*i as u8),
+            _ => None,
+        };
+        let mood_level = match row.get(11) {
+            Some(DataValue::Num(cozo::Num::Int(i))) => Some(*i as u8),
+            _ => None,
+        };
+        let hrv_score = match row.get(12) {
+            Some(DataValue::Num(cozo::Num::Float(f))) => Some(*f as f32),
+            _ => None,
+        };
+        let sleep_quality = match row.get(13) {
+            Some(DataValue::Num(cozo::Num::Float(f))) => Some(*f as f32),
+            _ => None,
+        };
+        let minutes_since_last_meeting = match row.get(14) {
+            Some(DataValue::Num(cozo::Num::Int(i))) => Some(*i as u32),
+            _ => None,
+        };
+
+        Some(CognitiveState {
+            was_in_flow,
+            was_on_call,
+            dominant_app,
+            time_of_day,
+            was_in_meeting,
+            was_in_focus_block,
+            energy_level,
+            mood_level,
+            hrv_score,
+            sleep_quality,
+            minutes_since_last_meeting,
         })
     }
 }
@@ -740,16 +825,27 @@ impl KnowledgeStore for CozoStore {
     fn upsert(&self, unit: KnowledgeUnit) -> Result<()> {
         // ── Deduplication ────────────────────────────────────────────────────
         {
-            let mut hashes = self
-                .hash_index
-                .lock()
-                .map_err(|_| CoreError::Internal("hash lock poisoned".to_string()))?;
-            if let Some(existing_id) = hashes.get(&unit.content_hash).copied() {
-                if existing_id != unit.id {
-                    return Ok(());
+            let mut params = BTreeMap::new();
+            params.insert(
+                "hash".to_string(),
+                DataValue::from(hash_to_string(&unit.content_hash)),
+            );
+            let query = r#"?[id] := *notes{id, hash: $hash}"#;
+
+            if let Ok(result) = self
+                .cozo
+                .run_script(query, params, ScriptMutability::Immutable)
+            {
+                if let Some(row) = result.rows.first() {
+                    if let Some(DataValue::Str(existing_id_str)) = row.get(0) {
+                        if let Ok(existing_id) = Uuid::parse_str(existing_id_str) {
+                            if existing_id != unit.id {
+                                return Ok(());
+                            }
+                        }
+                    }
                 }
             }
-            hashes.insert(unit.content_hash, unit.id);
         }
 
         // ── Derive cognitive state BEFORE any writes ──────────────────────────
@@ -790,15 +886,7 @@ impl KnowledgeStore for CozoStore {
             }
         };
 
-        // ── Update in-memory caches ───────────────────────────────────────────
-        self.units
-            .lock()
-            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-            .insert(unit.id, unit.clone());
-        let _ = self
-            .snapshots
-            .lock()
-            .map(|mut s| s.insert(unit.id, state.clone()));
+        // ── (In-memory caches removed) ────────────────────────────────────────
 
         // ── Atomic CozoDB writes: note and snapshot together ──────────────────
         // Both writes run unconditionally and back-to-back. The snapshot is
@@ -860,53 +948,47 @@ impl KnowledgeStore for CozoStore {
     }
 
     fn search_fulltext(&self, query: &str) -> Result<Vec<KnowledgeUnit>> {
-        // Use CozoDB native FTS index (`~notes:fts`) per NEXT.md Amendment 1.
-        // Falls back to in-memory scan only when FTS index is unavailable
-        // (e.g. freshly created store before any notes are indexed).
-        if !query.is_empty() {
-            let mut params = BTreeMap::new();
-            params.insert("query".to_string(), DataValue::from(query));
-            params.insert("k".to_string(), DataValue::from(50i64));
-
+        if query.is_empty() {
             let script = r#"
-?[id, source, title, content, hash, observed_at, score] :=
-    ~notes:fts{ id, title, content | query: $query, k: $k, score_field: score },
-    *notes{ id, source, hash, observed_at }
-:order -score
-:limit $k
+?[id, source, title, content, hash, observed_at, metadata] :=
+    *notes{ id, source, title, content, hash, observed_at, metadata }
+:order -observed_at
 "#;
-            if let Ok(result) = self
+            let result = self
                 .cozo
-                .run_script(script, params, ScriptMutability::Immutable)
-            {
-                let mut out = Vec::new();
+                .run_script(script, BTreeMap::new(), ScriptMutability::Immutable)
+                .map_err(|e| CoreError::Internal(format!("failed listing notes: {e}")))?;
+            let out = result
+                .rows
+                .iter()
+                .filter_map(|row| self.row_to_knowledge_unit(row))
+                .collect();
+            return Ok(out);
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert("query".to_string(), DataValue::from(query));
+        params.insert("k".to_string(), DataValue::from(50i64));
+
+        let script = r#"
+?[id, source, title, content, hash, observed_at, metadata] :=
+    ~notes:fts{ id, source, title, content, hash, observed_at, metadata | query: $query, k: $k }
+"#;
+        let mut out = Vec::new();
+        match self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+        {
+            Ok(result) => {
                 for row in result.rows {
                     if let Some(unit) = self.row_to_knowledge_unit(&row) {
                         out.push(unit);
                     }
                 }
-                if !out.is_empty() {
-                    return Ok(out);
-                }
             }
+            Err(_) => {}
         }
-
-        // Fallback: in-memory scan (empty-query case or FTS index not yet built)
-        Ok(self
-            .units
-            .lock()
-            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-            .values()
-            .filter(|unit| {
-                query.is_empty()
-                    || unit.content.contains(query)
-                    || unit
-                        .title
-                        .as_deref()
-                        .is_some_and(|title| title.contains(query))
-            })
-            .cloned()
-            .collect())
+        Ok(out)
     }
 
     fn related(&self, id: Uuid, depth: usize) -> Result<Vec<KnowledgeUnit>> {
@@ -914,49 +996,82 @@ impl KnowledgeStore for CozoStore {
             return Ok(Vec::new());
         }
 
-        let links = self
-            .links
-            .lock()
-            .map_err(|_| CoreError::Internal("links lock poisoned".to_string()))?
-            .clone();
-        let units = self
-            .units
-            .lock()
-            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-            .clone();
-
+        let mut visited: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        visited.insert(id);
         let mut frontier = vec![id];
-        let mut visited = HashSet::new();
-        let mut out = Vec::new();
+        let mut ordered_related = Vec::new();
+
+        let fwd_script = r#"?[to_id] := *links{from_id: $start_id, to_id}"#;
+        let bck_script = r#"?[from_id] := *links{from_id, to_id: $start_id}"#;
 
         for _ in 0..depth {
-            let mut next = Vec::new();
+            if frontier.is_empty() {
+                break;
+            }
+
+            let mut next_frontier = Vec::new();
             for node in frontier {
-                if !visited.insert(node) {
-                    continue;
-                }
-                if let Some(neighbors) = links.get(&node) {
-                    for neighbor in neighbors {
-                        if let Some(unit) = units.get(neighbor) {
-                            out.push(unit.clone());
+                let mut params = BTreeMap::new();
+                params.insert("start_id".to_string(), DataValue::from(node.to_string()));
+
+                if let Ok(result) =
+                    self.cozo
+                        .run_script(fwd_script, params.clone(), ScriptMutability::Immutable)
+                {
+                    for row in result.rows {
+                        if let Some(DataValue::Str(id_str)) = row.first() {
+                            if let Ok(target) = Uuid::parse_str(id_str) {
+                                if visited.insert(target) {
+                                    ordered_related.push(target);
+                                    next_frontier.push(target);
+                                }
+                            }
                         }
-                        next.push(*neighbor);
+                    }
+                }
+
+                if let Ok(result) =
+                    self.cozo
+                        .run_script(bck_script, params, ScriptMutability::Immutable)
+                {
+                    for row in result.rows {
+                        if let Some(DataValue::Str(id_str)) = row.first() {
+                            if let Ok(target) = Uuid::parse_str(id_str) {
+                                if visited.insert(target) {
+                                    ordered_related.push(target);
+                                    next_frontier.push(target);
+                                }
+                            }
+                        }
                     }
                 }
             }
-            frontier = next;
+            frontier = next_frontier;
         }
 
+        let mut out = Vec::new();
+        for rid in ordered_related {
+            if let Ok(Some(unit)) = self.get_by_id(rid) {
+                out.push(unit);
+            }
+        }
         Ok(out)
     }
 
     fn get_by_id(&self, id: Uuid) -> Result<Option<KnowledgeUnit>> {
-        Ok(self
-            .units
-            .lock()
-            .map_err(|_| CoreError::Internal("units lock poisoned".to_string()))?
-            .get(&id)
-            .cloned())
+        let mut params = BTreeMap::new();
+        params.insert("id".to_string(), DataValue::from(id.to_string()));
+        let script = r#"?[id, source, title, content, hash, observed_at, metadata] := *notes{id, source, title, content, hash, observed_at, metadata}, id = $id"#;
+
+        let result = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("cozo query error: {e}")))?;
+
+        Ok(result
+            .rows
+            .first()
+            .and_then(|row| self.row_to_knowledge_unit(row)))
     }
 
     fn record_pulse(&self, event: PulseEvent) -> Result<()> {
@@ -999,14 +1114,74 @@ impl KnowledgeStore for CozoStore {
         let Some(unit) = self.get_by_id(id)? else {
             return Ok(None);
         };
-        if let Some(state) = self
-            .snapshots
-            .lock()
-            .map_err(|_| CoreError::Internal("snapshots lock poisoned".to_string()))?
-            .get(&id)
-            .cloned()
+
+        // Query CozoDB for the snapshot
+        let mut params = BTreeMap::new();
+        params.insert("unit_id".to_string(), DataValue::from(id.to_string()));
+
+        let script = r#"
+?[unit_id, observed_at, window_secs, was_in_flow, was_on_call, dominant_app, time_of_day, context_switch_rate, was_in_meeting, was_in_focus_block, energy_level, mood_level, hrv_score, sleep_quality, minutes_since_last_meeting] :=
+    *cognitive_snapshots{unit_id, observed_at, window_secs, was_in_flow, was_on_call, dominant_app, time_of_day, context_switch_rate, was_in_meeting, was_in_focus_block, energy_level, mood_level, hrv_score, sleep_quality, minutes_since_last_meeting},
+    unit_id = $unit_id
+:limit 1
+"#;
+
+        if let Ok(result) = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
         {
-            return Ok(Some((unit, state)));
+            if let Some(row) = result.rows.first() {
+                // Parse the CognitiveState from the row
+                let state = CognitiveState {
+                    was_in_flow: match &row[3] {
+                        DataValue::Bool(b) => *b,
+                        _ => false,
+                    },
+                    was_on_call: match &row[4] {
+                        DataValue::Bool(b) => *b,
+                        _ => false,
+                    },
+                    dominant_app: match &row[5] {
+                        DataValue::Str(s) => Some(s.to_string()),
+                        _ => None,
+                    },
+                    time_of_day: match &row[6] {
+                        DataValue::Num(cozo::Num::Int(i)) => Some(*i as u8),
+                        _ => None,
+                    },
+                    was_in_meeting: match &row[8] {
+                        DataValue::Bool(b) => *b,
+                        _ => false,
+                    },
+                    was_in_focus_block: match &row[9] {
+                        DataValue::Bool(b) => *b,
+                        _ => false,
+                    },
+                    energy_level: match &row[10] {
+                        DataValue::Num(cozo::Num::Int(i)) => Some(*i as u8),
+                        _ => None,
+                    },
+                    mood_level: match &row[11] {
+                        DataValue::Num(cozo::Num::Int(i)) => Some(*i as u8),
+                        _ => None,
+                    },
+                    hrv_score: match &row[12] {
+                        DataValue::Num(cozo::Num::Float(f)) => Some(*f as f32),
+                        DataValue::Num(cozo::Num::Int(i)) => Some(*i as f32),
+                        _ => None,
+                    },
+                    sleep_quality: match &row[13] {
+                        DataValue::Num(cozo::Num::Float(f)) => Some(*f as f32),
+                        DataValue::Num(cozo::Num::Int(i)) => Some(*i as f32),
+                        _ => None,
+                    },
+                    minutes_since_last_meeting: match &row[14] {
+                        DataValue::Num(cozo::Num::Int(i)) => Some(*i as u32),
+                        _ => None,
+                    },
+                };
+                return Ok(Some((unit, state)));
+            }
         }
         let from = unit.observed_at - chrono::Duration::seconds(120);
         let to = unit.observed_at + chrono::Duration::seconds(120);
@@ -1024,143 +1199,82 @@ impl KnowledgeStore for CozoStore {
     }
 
     fn record_feedback(&self, event: FeedbackEvent) -> Result<()> {
-        self.feedback
-            .lock()
-            .map_err(|_| CoreError::Internal("feedback lock poisoned".to_string()))?
-            .push(event.clone());
         self.cozo_record_feedback(&event);
         Ok(())
     }
 
     fn feedback_score(&self, unit_id: Uuid) -> Result<f32> {
-        let guard = self
-            .feedback
-            .lock()
-            .map_err(|_| CoreError::Internal("feedback lock poisoned".to_string()))?;
-        let mut acted = 0f32;
-        let mut dismissed = 0f32;
+        let mut params = BTreeMap::new();
+        params.insert(
+            "target_id".to_string(),
+            DataValue::from(unit_id.to_string()),
+        );
 
-        for event in guard.iter() {
-            match &event.signal {
-                FeedbackSignal::QueryResultActedOn { unit_id: id, .. } if *id == unit_id => {
-                    acted += 1.0
-                }
-                FeedbackSignal::QueryResultDismissed { unit_id: id, .. } if *id == unit_id => {
-                    dismissed += 1.0
-                }
-                _ => {}
+        let script = r#"
+            weights[type, weight] <- [
+                ["query_result_acted_on", 1.0],
+                ["oracle_result_acted_on", 2.0],
+                ["query_result_dismissed", -0.5],
+                ["trigger_acknowledged", 1.0],
+                ["trigger_dismissed", -2.0]
+            ]
+            
+            # Get weights for all events for the target unit
+            ?[w] := *feedback_events{unit_id: $target_id, signal_type}, weights[signal_type, w]
+        "#;
+
+        let res = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to fetch feedback weights: {e}")))?;
+
+        let mut sum_weights = 0.0f32;
+        for row in res.rows {
+            if let Some(DataValue::Num(cozo::Num::Float(f))) = row.first() {
+                sum_weights += *f as f32;
             }
         }
 
-        let denom = acted + dismissed;
-        if denom == 0.0 {
+        if sum_weights == 0.0 {
             return Ok(0.5);
         }
-        Ok(acted / denom)
+
+        // Sigmoid squash: 1 / (1 + exp(-s))
+        let score = 1.0 / (1.0 + (-sum_weights).exp());
+        Ok(score)
     }
 
     fn pattern_feedback(&self, pattern_id: Uuid) -> Result<Option<String>> {
-        let guard = self
-            .feedback
-            .lock()
-            .map_err(|_| CoreError::Internal("feedback lock poisoned".to_string()))?;
+        let mut params = BTreeMap::new();
+        params.insert(
+            "target_id".to_string(),
+            DataValue::from(pattern_id.to_string()),
+        );
 
-        for event in guard.iter().rev() {
-            match &event.signal {
-                FeedbackSignal::PatternMarkedUseful { pattern_id: id } if *id == pattern_id => {
-                    return Ok(Some("useful".to_string()))
-                }
-                FeedbackSignal::PatternMarkedNoise { pattern_id: id } if *id == pattern_id => {
-                    return Ok(Some("noise".to_string()))
-                }
-                _ => {}
+        let script = r#"
+            ?[signal_type, timestamp] := *feedback_events{pattern_id: $target_id, signal_type, timestamp},
+                signal_type in ["pattern_marked_useful", "pattern_marked_noise"]
+            :sort -timestamp
+            :limit 1
+        "#;
+
+        let res = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to query pattern feedback: {e}")))?;
+
+        if let Some(row) = res.rows.first() {
+            if let Some(DataValue::Str(s)) = row.first() {
+                let status = if s == "pattern_marked_useful" {
+                    "useful"
+                } else {
+                    "noise"
+                };
+                return Ok(Some(status.to_string()));
             }
         }
 
         Ok(None)
-    }
-
-    fn upsert_lens(&self, unit_id: Uuid, lens_id: &str, vec: Vec<f32>) -> Result<()> {
-        let mut params = BTreeMap::new();
-        params.insert("unit_id".to_string(), DataValue::from(unit_id.to_string()));
-        params.insert("lens_id".to_string(), DataValue::from(lens_id.to_string()));
-        params.insert(
-            "vec".to_string(),
-            DataValue::List(vec.iter().map(|f| DataValue::from(*f as f64)).collect()),
-        );
-
-        let script = if lens_id == "l5_social" {
-            r#"
-?[unit_id, lens_id, vec] <- [[$unit_id, $lens_id, $vec]]
-:put lens_map_384 { unit_id, lens_id => vec }
-"#
-        } else {
-            r#"
-?[unit_id, lens_id, vec] <- [[$unit_id, $lens_id, $vec]]
-:put lens_map { unit_id, lens_id => vec }
-"#
-        };
-
-        self.cozo
-            .run_script(script, params, ScriptMutability::Mutable)
-            .map_err(|e| CoreError::Internal(format!("failed to upsert lens: {e}")))?;
-        Ok(())
-    }
-
-    fn search_lens(
-        &self,
-        lens_id: &str,
-        query_vec: &[f32],
-        k: usize,
-    ) -> Result<Vec<KnowledgeUnit>> {
-        if query_vec.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut params = BTreeMap::new();
-        params.insert("lens_id".to_string(), DataValue::from(lens_id.to_string()));
-        params.insert(
-            "vec".to_string(),
-            DataValue::List(
-                query_vec
-                    .iter()
-                    .map(|f| DataValue::from(*f as f64))
-                    .collect(),
-            ),
-        );
-        params.insert("k".to_string(), DataValue::from(k as i64));
-
-        let script = if lens_id == "l5_social" {
-            r#"
-?[id, source, title, content, hash, observed_at, dist] :=
-    ~lens_map_384:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist, filter: (lens_id == $lens_id) },
-    *notes{ id, source, title, content, hash, observed_at }
-:order dist
-:limit $k
-"#
-        } else {
-            r#"
-?[id, source, title, content, hash, observed_at, dist] :=
-    ~lens_map:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist, filter: (lens_id == $lens_id) },
-    *notes{ id, source, title, content, hash, observed_at }
-:order dist
-:limit $k
-"#
-        };
-        match self
-            .cozo
-            .run_script(script, params, ScriptMutability::Immutable)
-        {
-            Ok(result) => {
-                let out = result
-                    .rows
-                    .iter()
-                    .filter_map(|row| self.row_to_knowledge_unit(row))
-                    .collect();
-                Ok(out)
-            }
-            Err(_) => Ok(Vec::new()),
-        }
     }
 
     fn calculate_temporal_profile(&self, unit_id: Uuid) -> Result<()> {
@@ -1241,15 +1355,16 @@ impl KnowledgeStore for CozoStore {
     fn save_rule(&self, rule: ProceduralRule) -> Result<()> {
         let mut params = BTreeMap::new();
         params.insert("id".to_string(), DataValue::from(rule.id.to_string()));
-        params.insert(
-            "lens_intent".to_string(),
-            DataValue::List(
-                rule.lens_intent
-                    .iter()
-                    .map(|f| DataValue::from(*f as f64))
-                    .collect(),
-            ),
+
+        let lens_intent_str = format!(
+            "[{}]",
+            rule.lens_intent
+                .iter()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
         );
+
         params.insert(
             "pulse_mask".to_string(),
             DataValue::from(rule.pulse_mask.clone()),
@@ -1260,21 +1375,26 @@ impl KnowledgeStore for CozoStore {
         );
         params.insert(
             "action_payload".to_string(),
-            DataValue::Json(cozo::JsonData(rule.action_payload.clone())),
+            DataValue::from(
+                serde_json::to_string(&rule.action_payload).unwrap_or_else(|_| "{}".to_string()),
+            ),
         );
         params.insert(
             "created_at".to_string(),
             DataValue::from(rule.created_at.timestamp_millis() as f64),
         );
 
-        let script = r#"
+        let script = format!(
+            r#"
 ?[id, lens_intent, pulse_mask, threshold, action_payload, created_at] <- [[
-    $id, $lens_intent, $pulse_mask, $threshold, $action_payload, $created_at
+    $id, vec({lens_intent_str}), $pulse_mask, $threshold, parse_json($action_payload), $created_at
 ]]
-:put procedural_rules { id => lens_intent, pulse_mask, threshold, action_payload, created_at }
-"#;
+:put procedural_rules {{ id => lens_intent, pulse_mask, threshold, action_payload, created_at }}
+"#
+        );
+
         self.cozo
-            .run_script(script, params, ScriptMutability::Mutable)
+            .run_script(&script, params, ScriptMutability::Mutable)
             .map(|_| ())
             .map_err(|e| CoreError::Internal(format!("failed to save rule: {e}")))
     }
@@ -1294,60 +1414,165 @@ impl KnowledgeStore for CozoStore {
 
         let mut out = Vec::new();
         for row in res.rows {
-            let id_str = match &row[0] {
-                DataValue::Str(s) => s.to_string(),
-                _ => String::new(),
-            };
-            let id = Uuid::parse_str(&id_str).unwrap_or_default();
-            let lens_intent = match &row[1] {
-                DataValue::List(l) => l
-                    .iter()
-                    .map(|v| match v {
-                        DataValue::Num(cozo::Num::Float(f)) => *f as f32,
-                        _ => 0.0,
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            let pulse_mask = match &row[2] {
-                DataValue::Str(s) => s.to_string(),
-                _ => String::new(),
-            };
-            let threshold = match &row[3] {
-                DataValue::Num(cozo::Num::Float(f)) => *f as f32,
-                _ => 0.0,
-            };
-            let action_payload = match &row[4] {
-                DataValue::Json(j) => j.0.clone(),
-                _ => serde_json::Value::Null,
-            };
-            let created_at_ms = match &row[5] {
-                DataValue::Num(cozo::Num::Float(f)) => *f as i64,
-                DataValue::Num(cozo::Num::Int(i)) => *i,
-                _ => 0,
-            };
-            let created_at =
-                DateTime::from_timestamp_millis(created_at_ms).unwrap_or_else(Utc::now);
-
-            out.push(ProceduralRule {
-                id,
-                lens_intent,
-                pulse_mask,
-                threshold,
-                action_payload,
-                created_at,
-            });
+            if let Some(rule) = self.row_to_procedural_rule(&row) {
+                out.push(rule);
+            }
         }
         Ok(out)
     }
 
-    fn get_all_lens_vectors(&self, lens_id: &str) -> Result<Vec<(Uuid, Vec<f32>)>> {
+    fn get_all_rules(&self) -> Result<Vec<ProceduralRule>> {
+        let script = r#"
+?[id, lens_intent, pulse_mask, threshold, action_payload, created_at] :=
+    *procedural_rules{ id, lens_intent, pulse_mask, threshold, action_payload, created_at }
+"#;
+        let res = self
+            .cozo
+            .run_script(script, BTreeMap::new(), ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to fetch all rules: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in res.rows {
+            if let Some(rule) = self.row_to_procedural_rule(&row) {
+                out.push(rule);
+            }
+        }
+        Ok(out)
+    }
+
+    fn get_recent_snapshots(&self, limit: usize) -> Result<Vec<(Uuid, CognitiveState)>> {
         let mut params = BTreeMap::new();
-        params.insert("lens_id".to_string(), DataValue::from(lens_id));
+        params.insert("limit".to_string(), DataValue::from(limit as i64));
 
         let script = r#"
-?[unit_id, vec] := *lens_map{ unit_id, lens_id: $lens_id, vec }
+?[unit_id, observed_at, window_secs, was_in_flow, was_on_call, dominant_app, time_of_day, context_switch_rate, was_in_meeting, was_in_focus_block, energy_level, mood_level, hrv_score, sleep_quality, minutes_since_last_meeting] :=
+    *cognitive_snapshots{ unit_id, observed_at, window_secs, was_in_flow, was_on_call, dominant_app, time_of_day, context_switch_rate, was_in_meeting, was_in_focus_block, energy_level, mood_level, hrv_score, sleep_quality, minutes_since_last_meeting }
+:order -observed_at
+:limit $limit
 "#;
+        let res = self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+            .map_err(|e| CoreError::Internal(format!("failed to fetch recent snapshots: {e}")))?;
+
+        let mut out = Vec::new();
+        for row in res.rows {
+            if let (Some(DataValue::Str(id_s)), Some(state)) =
+                (row.get(0), self.row_to_cognitive_state(&row))
+            {
+                if let Ok(id) = Uuid::parse_str(id_s.as_str()) {
+                    out.push((id, state));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl LensIndexStore for CozoStore {
+    fn upsert_lens_vec(&self, unit_id: Uuid, lens: &LensConfig, vec: &[f32]) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("unit_id".to_string(), DataValue::from(unit_id.to_string()));
+        params.insert(
+            "lens_id".to_string(),
+            DataValue::from(lens.id.as_str().to_string()),
+        );
+        params.insert(
+            "vec".to_string(),
+            DataValue::List(vec.iter().map(|f| DataValue::from(*f as f64)).collect()),
+        );
+
+        let script = if lens.dimensions == 384 {
+            r#"
+?[unit_id, lens_id, vec] <- [[$unit_id, $lens_id, $vec]]
+:put lens_map_384 { unit_id, lens_id => vec }
+"#
+        } else {
+            r#"
+?[unit_id, lens_id, vec] <- [[$unit_id, $lens_id, $vec]]
+:put lens_map { unit_id, lens_id => vec }
+"#
+        };
+
+        self.cozo
+            .run_script(script, params, ScriptMutability::Mutable)
+            .map_err(|e| CoreError::Internal(format!("failed to upsert lens: {e}")))?;
+        Ok(())
+    }
+
+    fn search_lens_vec(&self, lens: &LensConfig, query_vec: &[f32], k: usize) -> Result<Vec<Uuid>> {
+        if query_vec.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut params = BTreeMap::new();
+        params.insert(
+            "lens_id".to_string(),
+            DataValue::from(lens.id.as_str().to_string()),
+        );
+        params.insert(
+            "vec".to_string(),
+            DataValue::List(
+                query_vec
+                    .iter()
+                    .map(|f| DataValue::from(*f as f64))
+                    .collect(),
+            ),
+        );
+        params.insert("k".to_string(), DataValue::from(k as i64));
+
+        let script = if lens.dimensions == 384 {
+            r#"
+?[id, dist] := ~lens_map_384:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist, filter: (lens_id == $lens_id) }
+:order dist
+:limit $k
+"#
+        } else {
+            r#"
+?[id, dist] := ~lens_map:vec_idx{ unit_id: id | query: $vec, k: $k, ef: 50, bind_distance: dist, filter: (lens_id == $lens_id) }
+:order dist
+:limit $k
+"#
+        };
+        match self
+            .cozo
+            .run_script(script, params, ScriptMutability::Immutable)
+        {
+            Ok(result) => {
+                let out = result
+                    .rows
+                    .iter()
+                    .filter_map(|row| {
+                        if let Some(DataValue::Str(id_str)) = row.first() {
+                            Uuid::parse_str(id_str).ok()
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                Ok(out)
+            }
+            Err(_) => Ok(Vec::new()),
+        }
+    }
+
+    fn get_all_lens_vectors(&self, lens: &LensConfig) -> Result<Vec<(Uuid, Vec<f32>)>> {
+        let mut params = BTreeMap::new();
+        params.insert(
+            "lens_id".to_string(),
+            DataValue::from(lens.id.as_str().to_string()),
+        );
+
+        let script = if lens.dimensions == 384 {
+            r#"
+?[unit_id, vec] := *lens_map_384{ unit_id, lens_id: $lens_id, vec }
+"#
+        } else {
+            r#"
+?[unit_id, vec] := *lens_map{ unit_id, lens_id: $lens_id, vec }
+"#
+        };
+
         let res = self
             .cozo
             .run_script(script, params, ScriptMutability::Immutable)
@@ -1507,5 +1732,199 @@ mod tests {
         assert!(state.was_in_flow);
         assert!(state.was_on_call);
         assert_eq!(state.dominant_app.as_deref(), Some("com.test"));
+    }
+
+    #[test]
+    fn search_fulltext_empty_returns_all_notes() {
+        let store = CozoStore::new_for_test().expect("store should build");
+        let now = Utc::now();
+
+        for i in 0..3 {
+            store
+                .upsert(KnowledgeUnit {
+                    id: Uuid::new_v4(),
+                    source: SourceId::new("obsidian"),
+                    content: format!("note {i}"),
+                    title: Some(format!("N{i}")),
+                    metadata: HashMap::new(),
+                    observed_at: now + chrono::Duration::seconds(i),
+                    content_hash: [i as u8 + 1; 32],
+                })
+                .expect("upsert");
+        }
+
+        let all = store.search_fulltext("").expect("search");
+        assert_eq!(all.len(), 3);
+    }
+
+    #[test]
+    fn related_uses_graph_depth_not_result_count() {
+        let store = CozoStore::new_for_test().expect("store should build");
+        let now = Utc::now();
+
+        let id_c = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+        let id_a = Uuid::new_v4();
+
+        store
+            .upsert(KnowledgeUnit {
+                id: id_c,
+                source: SourceId::new("obsidian"),
+                content: "C".to_string(),
+                title: Some("C".to_string()),
+                metadata: HashMap::from([("links".to_string(), serde_json::json!([]))]),
+                observed_at: now,
+                content_hash: [31; 32],
+            })
+            .expect("upsert C");
+        store
+            .upsert(KnowledgeUnit {
+                id: id_b,
+                source: SourceId::new("obsidian"),
+                content: "B links [[C]]".to_string(),
+                title: Some("B".to_string()),
+                metadata: HashMap::from([("links".to_string(), serde_json::json!(["C"]))]),
+                observed_at: now + chrono::Duration::seconds(1),
+                content_hash: [32; 32],
+            })
+            .expect("upsert B");
+        store
+            .upsert(KnowledgeUnit {
+                id: id_a,
+                source: SourceId::new("obsidian"),
+                content: "A links [[B]]".to_string(),
+                title: Some("A".to_string()),
+                metadata: HashMap::from([("links".to_string(), serde_json::json!(["B"]))]),
+                observed_at: now + chrono::Duration::seconds(2),
+                content_hash: [33; 32],
+            })
+            .expect("upsert A");
+
+        let depth1 = store.related(id_a, 1).expect("related d1");
+        let depth2 = store.related(id_a, 2).expect("related d2");
+
+        assert!(depth1.iter().any(|u| u.id == id_b));
+        assert!(!depth1.iter().any(|u| u.id == id_c));
+        assert!(depth2.iter().any(|u| u.id == id_c));
+    }
+
+    #[test]
+    fn feedback_scoring_logic_is_weighted_and_squashed() {
+        let store = CozoStore::new_for_test().expect("store should build");
+        let id_a = Uuid::new_v4();
+        let id_b = Uuid::new_v4();
+
+        // 1. Initial neutral score
+        let rels = store
+            .cozo
+            .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)
+            .expect("rels");
+        println!("Available relations: {:?}", rels);
+        assert_eq!(store.feedback_score(id_a).expect("score"), 0.5);
+
+        // 2. Positive signal (Acted On: +1)
+        store
+            .record_feedback(FeedbackEvent {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                signal: FeedbackSignal::QueryResultActedOn {
+                    query_text: "test".to_string(),
+                    unit_id: id_a,
+                    action: ambient_core::ResultAction::OpenedSource,
+                    ms_to_action: 1000,
+                },
+            })
+            .expect("record");
+
+        // sigmoid(1) ~= 0.73
+        let score_post_positive = store.feedback_score(id_a).expect("score");
+        assert!(score_post_positive > 0.7 && score_post_positive < 0.75);
+
+        // 3. Oracle boost (Oracle Acted: +2) -> total +3
+        store
+            .record_feedback(FeedbackEvent {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                signal: FeedbackSignal::OracleResultActedOn {
+                    query_text: "test".to_string(),
+                    unit_id: id_a,
+                    action: ambient_core::ResultAction::OpenedSource,
+                    ms_to_action: 1000,
+                    active_lens_snapshot: None,
+                },
+            })
+            .expect("record");
+
+        // sigmoid(3) ~= 0.95
+        let score_post_oracle = store.feedback_score(id_a).expect("score");
+        assert!(score_post_oracle > 0.9);
+
+        // 4. Negative signal (Dismissed: -0.5) for a DIFFERENT unit
+        store
+            .record_feedback(FeedbackEvent {
+                id: Uuid::new_v4(),
+                timestamp: Utc::now(),
+                signal: FeedbackSignal::QueryResultDismissed {
+                    query_text: "test".to_string(),
+                    unit_id: id_b,
+                },
+            })
+            .expect("record");
+
+        // sigmoid(-0.5) ~= 0.37
+        let score_b = store.feedback_score(id_b).expect("score");
+        assert!(score_b > 0.35 && score_b < 0.4);
+    }
+
+    #[test]
+    fn get_recent_snapshots_retrieves_latest_first() {
+        let store = CozoStore::new_for_test().expect("store");
+        let id1 = Uuid::new_v4();
+        let id2 = Uuid::new_v4();
+        let now = Utc::now();
+
+        // We use upsert to create snapshots
+        store
+            .upsert(KnowledgeUnit {
+                id: id1,
+                source: SourceId::new("test"),
+                content: "a".to_string(),
+                title: None,
+                metadata: HashMap::new(),
+                observed_at: now - chrono::Duration::minutes(10),
+                content_hash: [1; 32],
+            })
+            .expect("upsert 1");
+
+        store
+            .upsert(KnowledgeUnit {
+                id: id2,
+                source: SourceId::new("test"),
+                content: "b".to_string(),
+                title: None,
+                metadata: HashMap::new(),
+                observed_at: now,
+                content_hash: [2; 32],
+            })
+            .expect("upsert 2");
+
+        let snapshots = store.get_recent_snapshots(10).expect("query");
+        assert!(snapshots.len() >= 2);
+        // Latest first
+        assert_eq!(snapshots[0].0, id2);
+        assert_eq!(snapshots[1].0, id1);
+    }
+
+    #[test]
+    fn get_all_rules_retrieves_saved_rules() {
+        let _store = CozoStore::new_for_test().expect("store");
+        let _rule = ProceduralRule {
+            id: Uuid::new_v4(),
+            lens_intent: vec![1.0; 768],
+            pulse_mask: "com.apple.Safari".to_string(),
+            threshold: 0.5,
+            action_payload: serde_json::json!({"action": "notify"}),
+            created_at: Utc::now(),
+        };
     }
 }

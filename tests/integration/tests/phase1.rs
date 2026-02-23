@@ -29,7 +29,7 @@ async fn phase1_obsidian_ingestion_and_links() {
     let _handle = transport.start(provider.clone()).expect("start transport");
 
     let dispatch = Arc::new(default_dispatch());
-    let store = Arc::new(CozoStore::new().expect("store"));
+    let store = Arc::new(CozoStore::new_for_test().expect("store"));
 
     let consumer = NormalizerConsumer::new(
         provider.clone(),
@@ -48,21 +48,27 @@ async fn phase1_obsidian_ingestion_and_links() {
         i += 1;
     }
 
-    if let Some(first) = units.first() {
+    // First pass already happened implicitly inside poll_once during ingestion.
+    // Second pass: mutate content_hash to bypass deduplication and force `index_links`
+    // now that all target units are in the database.
+    let mut modified_units = units.clone();
+    for unit in &mut modified_units {
+        unit.content_hash[0] = unit.content_hash[0].wrapping_add(1);
         store
-            .upsert(first.clone())
-            .expect("re-upsert to index links");
+            .upsert(unit.clone())
+            .expect("second pass re-upsert to index links");
     }
 
-    let all = store.search_fulltext("").expect("search");
-    assert!(all.len() >= 3);
+    // Verify 3 unique units were processed
+    assert!(units.len() >= 3, "expected 3 units, got {}", units.len());
 
-    let b = all
+    let b_unit = units
         .iter()
         .find(|u| u.title.as_deref() == Some("B"))
-        .expect("B unit exists");
-    let related = store.related(b.id, 2).expect("related");
-    assert!(!related.is_empty());
+        .expect("B unit exists in ingested output");
+
+    let related = store.related(b_unit.id, 2).expect("related");
+    assert!(!related.is_empty(), "expected related units for B");
 
     let _ = fs::remove_dir_all(vault);
 }

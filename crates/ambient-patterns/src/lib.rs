@@ -15,13 +15,68 @@ use std::time::{Duration, Instant};
 
 use ambient_core::{
     CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore, KnowledgeUnit,
-    QueryRequest, QueryResult, Result, ResultAction, SourceId, Uuid,
+    PredictedAction, QueryRequest, QueryResult, Result, ResultAction, SourceId, Uuid,
 };
 use chrono::{Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
 use ndarray::Array2;
 use petal_clustering::{Dbscan, Fit};
 use petal_neighbors::distance::Euclidean;
+
+pub struct ActionPredictor {
+    store: Arc<dyn KnowledgeStore>,
+}
+
+impl ActionPredictor {
+    pub fn new(store: Arc<dyn KnowledgeStore>) -> Self {
+        Self { store }
+    }
+
+    pub fn predict(&self, limit: usize) -> Result<Vec<PredictedAction>> {
+        let snapshots = self.store.get_recent_snapshots(limit)?;
+        let rules = self.store.get_all_rules()?;
+
+        let mut predictions = Vec::new();
+
+        for rule in rules {
+            // 1. Check Pulse Mask
+            // For now, if pulse_mask is specified, we check if it matches the latest dominant_app
+            let pulse_match = if rule.pulse_mask.is_empty() {
+                true
+            } else {
+                snapshots
+                    .get(0)
+                    .map(|(_, s)| s.dominant_app.as_deref() == Some(&rule.pulse_mask))
+                    .unwrap_or(false)
+            };
+
+            if !pulse_match {
+                continue;
+            }
+
+            // 2. Check Context (Simplified)
+            // If the rule has no lens_intent, we treat it as a pure pulse-triggered rule
+            let score = if rule.lens_intent.is_empty() {
+                1.0
+            } else {
+                // Future: implementation of lens-based intent matching
+                // For now, if it matched pulse, we give it a baseline
+                0.8
+            };
+
+            if score >= rule.threshold {
+                predictions.push(PredictedAction {
+                    rule_id: rule.id,
+                    action_payload: rule.action_payload.clone(),
+                    confidence: score,
+                    trigger_reason: format!("Matches pulse mask: {}", rule.pulse_mask),
+                });
+            }
+        }
+
+        Ok(predictions)
+    }
+}
 
 // ── PatternInsight ─────────────────────────────────────────────────────────────
 
@@ -366,6 +421,7 @@ impl PatternDetector {
                 cognitive_state,
                 historical_feedback_score: 0.5,
                 capability_status: None,
+                predicted_actions: None,
             });
         }
 
@@ -450,12 +506,13 @@ pub struct PatternScheduler {
 impl PatternScheduler {
     pub fn new(
         store: Arc<dyn KnowledgeStore>,
+        index_store: Arc<dyn ambient_core::LensIndexStore>,
         reasoner: Arc<dyn ambient_core::ReasoningEngine>,
         report_dir: PathBuf,
     ) -> Self {
         Self {
             detector: PatternDetector::new(store.clone()),
-            noticer: NoticerConsumer::new(store, reasoner),
+            noticer: NoticerConsumer::new(store, index_store, reasoner),
             probe: Arc::new(DefaultSchedulerProbe),
             poll_interval: Duration::from_secs(60),
             report_dir,
@@ -541,20 +598,28 @@ impl PatternScheduler {
 
 pub struct NoticerConsumer {
     store: Arc<dyn KnowledgeStore>,
+    index_store: Arc<dyn ambient_core::LensIndexStore>,
     reasoner: Arc<dyn ambient_core::ReasoningEngine>,
 }
 
 impl NoticerConsumer {
     pub fn new(
         store: Arc<dyn KnowledgeStore>,
+        index_store: Arc<dyn ambient_core::LensIndexStore>,
         reasoner: Arc<dyn ambient_core::ReasoningEngine>,
     ) -> Self {
-        Self { store, reasoner }
+        Self {
+            store,
+            index_store,
+            reasoner,
+        }
     }
 
     /// Run a discovery cycle: fetch all L1 vectors, cluster them, and generate rules.
     pub fn run_discovery_cycle(&self) -> Result<()> {
-        let vectors = self.store.get_all_lens_vectors("l1_semantic")?;
+        let vectors = self
+            .index_store
+            .get_all_lens_vectors(&ambient_core::LensConfig::semantic())?;
         if vectors.len() < 10 {
             return Ok(());
         }
@@ -607,7 +672,7 @@ impl NoticerConsumer {
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&response) {
             // Calculate centroid of the cluster for lens_intent
             // (Omitted for brevity, using first unit's vector as proxy for now)
-            let lens_intent = self.store.get_all_lens_vectors("l1_semantic")? // Inefficient but works for MVP
+            let lens_intent = self.index_store.get_all_lens_vectors(&ambient_core::LensConfig::semantic())? // Inefficient but works for MVP
                 .into_iter()
                 .find(|(id, _)| *id == unit_ids[0])
                 .map(|(_, v)| v)
@@ -635,6 +700,8 @@ impl NoticerConsumer {
 struct PendingQuery {
     query_text: String,
     unit_ids: Vec<Uuid>,
+    is_oracle: bool,
+    active_lens: Option<Vec<f32>>,
     started_at: Instant,
 }
 
@@ -649,97 +716,137 @@ struct PendingQuery {
 /// Callers push signals via `on_file_opened` / `on_query_result` / `on_context_switch`.
 pub struct ImplicitFeedbackRecorder {
     store: Arc<dyn KnowledgeStore>,
-    pending: Mutex<Option<PendingQuery>>,
+    pending: Mutex<Vec<PendingQuery>>,
 }
 
 impl ImplicitFeedbackRecorder {
     pub fn new(store: Arc<dyn KnowledgeStore>) -> Self {
         Self {
             store,
-            pending: Mutex::new(None),
+            pending: Mutex::new(Vec::new()),
         }
     }
 
     /// Called immediately after query results are displayed.
     /// Begins the 60-second observation window.
-    pub fn on_query_result(&self, query_text: &str, unit_ids: Vec<Uuid>) {
+    pub fn on_query_result(
+        &self,
+        query_text: &str,
+        unit_ids: Vec<Uuid>,
+        is_oracle: bool,
+        active_lens: Option<Vec<f32>>,
+    ) {
         if let Ok(mut guard) = self.pending.lock() {
-            *guard = Some(PendingQuery {
+            guard.push(PendingQuery {
                 query_text: query_text.to_string(),
                 unit_ids,
+                is_oracle,
+                active_lens,
                 started_at: Instant::now(),
             });
+            // Keep at most 20 recent queries
+            if guard.len() > 20 {
+                guard.remove(0);
+            }
         }
     }
 
     /// Called when the user opens a file (from ActiveAppSampler correlation).
     /// Matches against pending result source paths.
     pub fn on_file_opened(&self, file_path: &str) {
-        let pending = match self.pending.lock().ok().and_then(|g| g.clone()) {
-            Some(p) if p.started_at.elapsed() <= Duration::from_secs(60) => p,
-            _ => return,
-        };
+        let mut matching_event = None;
 
-        // Check if any pending unit's source matches the opened file
-        for &unit_id in &pending.unit_ids {
-            if let Ok(Some(unit)) = self.store.get_by_id(unit_id) {
-                if unit.source.0.contains(file_path) || file_path.contains(&unit.source.0) {
-                    let ms_to_action = pending.started_at.elapsed().as_millis() as u32;
-                    let event = FeedbackEvent {
-                        id: Uuid::new_v4(),
-                        timestamp: Utc::now(),
-                        signal: FeedbackSignal::QueryResultActedOn {
-                            query_text: pending.query_text.clone(),
-                            unit_id,
-                            action: ResultAction::OpenedSource,
-                            ms_to_action,
-                        },
-                    };
-                    let _ = self.store.record_feedback(event);
-                    // Clear pending after first match to avoid duplicates
-                    if let Ok(mut guard) = self.pending.lock() {
-                        *guard = None;
+        if let Ok(mut guard) = self.pending.lock() {
+            // Prune expired queries
+            guard.retain(|p| p.started_at.elapsed() <= Duration::from_secs(60));
+
+            for p in guard.iter() {
+                for &unit_id in &p.unit_ids {
+                    if let Ok(Some(unit)) = self.store.get_by_id(unit_id) {
+                        if unit.source.0.contains(file_path) || file_path.contains(&unit.source.0) {
+                            let ms_to_action = p.started_at.elapsed().as_millis() as u32;
+                            let signal = if p.is_oracle {
+                                FeedbackSignal::OracleResultActedOn {
+                                    query_text: p.query_text.clone(),
+                                    unit_id,
+                                    action: ResultAction::OpenedSource,
+                                    ms_to_action,
+                                    active_lens_snapshot: p.active_lens.clone(),
+                                }
+                            } else {
+                                FeedbackSignal::QueryResultActedOn {
+                                    query_text: p.query_text.clone(),
+                                    unit_id,
+                                    action: ResultAction::OpenedSource,
+                                    ms_to_action,
+                                }
+                            };
+
+                            matching_event = Some(FeedbackEvent {
+                                id: Uuid::new_v4(),
+                                timestamp: Utc::now(),
+                                signal,
+                            });
+                            break;
+                        }
                     }
-                    return;
+                }
+                if matching_event.is_some() {
+                    break;
                 }
             }
+            // If we matched something, we could remove that specific pending query
+            // but for simplicity we'll just let it expire or be cleared by first match.
+            // Let's clear the whole list of matched unit's query to avoid duplicate signals for same action.
+            if let Some(ref ev) = matching_event {
+                if let FeedbackSignal::QueryResultActedOn { ref query_text, .. }
+                | FeedbackSignal::OracleResultActedOn { ref query_text, .. } = ev.signal
+                {
+                    guard.retain(|p| &p.query_text != query_text);
+                }
+            }
+        }
+
+        if let Some(event) = matching_event {
+            let _ = self.store.record_feedback(event);
         }
     }
 
     /// Called when a rapid context switch is detected within 5s of displaying results.
     /// Records an implicit negative signal.
     pub fn on_context_switch_spike(&self, switches_per_minute: f32) {
-        let Some(pending) = self.pending.lock().ok().and_then(|g| g.clone()) else {
-            return;
-        };
+        let mut dismissal_event = None;
 
-        // Only treat as implicit dismiss if: < 5s since results + switch rate spiked
-        let elapsed = pending.started_at.elapsed();
-        if elapsed > Duration::from_secs(5) || switches_per_minute < 1.0 {
-            return;
+        if let Ok(mut guard) = self.pending.lock() {
+            if let Some(p) = guard.last() {
+                let elapsed = p.started_at.elapsed();
+                if elapsed <= Duration::from_secs(5) && switches_per_minute >= 1.0 {
+                    if let Some(&unit_id) = p.unit_ids.first() {
+                        dismissal_event = Some(FeedbackEvent {
+                            id: Uuid::new_v4(),
+                            timestamp: Utc::now(),
+                            signal: FeedbackSignal::QueryResultDismissed {
+                                query_text: p.query_text.clone(),
+                                unit_id,
+                            },
+                        });
+                    }
+                }
+            }
+            if dismissal_event.is_some() {
+                guard.pop();
+            }
         }
 
-        // Record dismiss for the top result only (first unit_id)
-        if let Some(&unit_id) = pending.unit_ids.first() {
-            let event = FeedbackEvent {
-                id: Uuid::new_v4(),
-                timestamp: Utc::now(),
-                signal: FeedbackSignal::QueryResultDismissed {
-                    query_text: pending.query_text.clone(),
-                    unit_id,
-                },
-            };
+        if let Some(event) = dismissal_event {
             let _ = self.store.record_feedback(event);
-            if let Ok(mut guard) = self.pending.lock() {
-                *guard = None;
-            }
         }
     }
 
     /// Clear pending state (e.g., on daemon restart).
     pub fn reset(&self) {
         if let Ok(mut guard) = self.pending.lock() {
-            *guard = None;
+            guard.clear();
         }
     }
 }
@@ -878,12 +985,16 @@ mod tests {
 
     struct MockStore {
         units: Mutex<Vec<KnowledgeUnit>>,
+        snapshots: Mutex<Vec<(Uuid, CognitiveState)>>,
+        rules: Mutex<Vec<ambient_core::ProceduralRule>>,
     }
 
     impl MockStore {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 units: Mutex::new(Vec::new()),
+                snapshots: Mutex::new(Vec::new()),
+                rules: Mutex::new(Vec::new()),
             })
         }
     }
@@ -952,12 +1063,6 @@ mod tests {
         fn pattern_feedback(&self, _id: Uuid) -> AResult<Option<String>> {
             Ok(None)
         }
-        fn upsert_lens(&self, _id: Uuid, _l: &str, _v: Vec<f32>) -> AResult<()> {
-            Ok(())
-        }
-        fn search_lens(&self, _l: &str, _v: &[f32], _k: usize) -> AResult<Vec<KnowledgeUnit>> {
-            Ok(self.units.lock().unwrap().clone())
-        }
 
         fn calculate_temporal_profile(&self, _unit_id: Uuid) -> AResult<()> {
             Ok(())
@@ -981,7 +1086,36 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn get_all_lens_vectors(&self, _lens_id: &str) -> AResult<Vec<(Uuid, Vec<f32>)>> {
+        fn get_all_rules(&self) -> AResult<Vec<ambient_core::ProceduralRule>> {
+            Ok(self.rules.lock().unwrap().clone())
+        }
+
+        fn get_recent_snapshots(&self, _limit: usize) -> AResult<Vec<(Uuid, CognitiveState)>> {
+            Ok(self.snapshots.lock().unwrap().clone())
+        }
+    }
+
+    impl ambient_core::LensIndexStore for MockStore {
+        fn upsert_lens_vec(
+            &self,
+            _id: Uuid,
+            _lens: &ambient_core::LensConfig,
+            _v: &[f32],
+        ) -> AResult<()> {
+            Ok(())
+        }
+        fn search_lens_vec(
+            &self,
+            _l: &ambient_core::LensConfig,
+            _v: &[f32],
+            _k: usize,
+        ) -> AResult<Vec<Uuid>> {
+            Ok(self.units.lock().unwrap().iter().map(|u| u.id).collect())
+        }
+        fn get_all_lens_vectors(
+            &self,
+            _lens: &ambient_core::LensConfig,
+        ) -> AResult<Vec<(Uuid, Vec<f32>)>> {
             Ok(Vec::new())
         }
     }
@@ -1016,6 +1150,7 @@ mod tests {
             cognitive_state: Some(state),
             historical_feedback_score: 0.5,
             capability_status: None,
+            predicted_actions: None,
         }
     }
 
@@ -1060,7 +1195,7 @@ mod tests {
         let store = MockStore::new();
         let recorder = ImplicitFeedbackRecorder::new(store.clone());
         let unit_id = Uuid::new_v4();
-        recorder.on_query_result("test query", vec![unit_id]);
+        recorder.on_query_result("test query", vec![unit_id], false, None);
         // File opened after 61s — should NOT record (but we can't sleep in a unit test)
         // Just verify the recorder stays clean when no file is opened
         recorder.reset();
@@ -1072,7 +1207,7 @@ mod tests {
         let store = MockStore::new();
         let recorder = ImplicitFeedbackRecorder::new(store);
         let unit_id = Uuid::new_v4();
-        recorder.on_query_result("test query", vec![unit_id]);
+        recorder.on_query_result("test query", vec![unit_id], false, None);
         // Spike rate low — should not record dismiss
         recorder.on_context_switch_spike(0.5);
         // No panic
@@ -1093,6 +1228,78 @@ mod tests {
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("flow-cluster"));
         assert!(content.contains("feedback-btn"));
-        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_predict_matches_pulse_mask() {
+        let store = MockStore::new();
+        let rule_id = Uuid::new_v4();
+        let rule = ambient_core::ProceduralRule {
+            id: rule_id,
+            lens_intent: Vec::new(),
+            pulse_mask: "com.apple.Safari".to_string(),
+            threshold: 0.5,
+            action_payload: serde_json::json!({"action": "notify"}),
+            created_at: Utc::now(),
+        };
+        store.rules.lock().unwrap().push(rule);
+
+        let snapshot_id = Uuid::new_v4();
+        let state = CognitiveState {
+            was_in_flow: false,
+            was_on_call: false,
+            dominant_app: Some("com.apple.Safari".to_string()),
+            time_of_day: None,
+            was_in_meeting: false,
+            was_in_focus_block: false,
+            energy_level: None,
+            mood_level: None,
+            hrv_score: None,
+            sleep_quality: None,
+            minutes_since_last_meeting: None,
+        };
+        store.snapshots.lock().unwrap().push((snapshot_id, state));
+
+        let predictor = ActionPredictor::new(store);
+        let predictions = predictor.predict(1).unwrap();
+        assert_eq!(predictions.len(), 1);
+        assert_eq!(predictions[0].rule_id, rule_id);
+    }
+
+    #[test]
+    fn test_predict_ignores_mismatched_pulse_mask() {
+        let store = MockStore::new();
+        let rule = ambient_core::ProceduralRule {
+            id: Uuid::new_v4(),
+            lens_intent: Vec::new(),
+            pulse_mask: "com.apple.Safari".to_string(),
+            threshold: 0.5,
+            action_payload: serde_json::json!({"action": "notify"}),
+            created_at: Utc::now(),
+        };
+        store.rules.lock().unwrap().push(rule);
+
+        let state = CognitiveState {
+            was_in_flow: false,
+            was_on_call: false,
+            dominant_app: Some("com.apple.Mail".to_string()),
+            time_of_day: None,
+            was_in_meeting: false,
+            was_in_focus_block: false,
+            energy_level: None,
+            mood_level: None,
+            hrv_score: None,
+            sleep_quality: None,
+            minutes_since_last_meeting: None,
+        };
+        store
+            .snapshots
+            .lock()
+            .unwrap()
+            .push((Uuid::new_v4(), state));
+
+        let predictor = ActionPredictor::new(store);
+        let predictions = predictor.predict(1).unwrap();
+        assert_eq!(predictions.len(), 0);
     }
 }

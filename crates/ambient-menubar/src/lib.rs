@@ -450,6 +450,7 @@ mod tests {
             cognitive_state: None,
             historical_feedback_score: 0.5,
             capability_status: None,
+            predicted_actions: None,
         });
         let gate = MockLicenseGate {
             is_pro_user: true,

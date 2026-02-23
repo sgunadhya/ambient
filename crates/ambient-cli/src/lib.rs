@@ -204,6 +204,7 @@ pub struct PulseConsumer {
     store: Arc<dyn KnowledgeStore>,
     consumer_id: ConsumerId,
     offset: Mutex<Offset>,
+    recorder: Option<Arc<ambient_patterns::ImplicitFeedbackRecorder>>,
 }
 
 impl PulseConsumer {
@@ -211,6 +212,7 @@ impl PulseConsumer {
         provider: Arc<dyn StreamProvider>,
         store: Arc<dyn KnowledgeStore>,
         consumer_id: ConsumerId,
+        recorder: Option<Arc<ambient_patterns::ImplicitFeedbackRecorder>>,
     ) -> Result<Self> {
         let offset = provider.last_committed(&consumer_id)?.unwrap_or(0);
         Ok(Self {
@@ -218,6 +220,7 @@ impl PulseConsumer {
             store,
             consumer_id,
             offset: Mutex::new(offset),
+            recorder,
         })
     }
 
@@ -230,8 +233,23 @@ impl PulseConsumer {
 
         for (next_offset, entry) in batch {
             if let EventLogEntry::Pulse(event) = entry {
-                if self.store.record_pulse(event).is_ok() {
+                if self.store.record_pulse(event.clone()).is_ok() {
                     written += 1;
+                    if let Some(ref recorder) = self.recorder {
+                        match event.signal {
+                            PulseSignal::ContextSwitchRate {
+                                switches_per_minute,
+                            } => {
+                                recorder.on_context_switch_spike(switches_per_minute);
+                            }
+                            PulseSignal::ActiveApp { window_title, .. } => {
+                                if let Some(title) = window_title {
+                                    recorder.on_file_opened(&title);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
                 }
             }
             self.provider.commit(&self.consumer_id, next_offset)?;
@@ -705,6 +723,38 @@ pub fn record_query_feedback(
     Ok(event)
 }
 
+pub fn record_oracle_feedback(
+    store: &dyn KnowledgeStore,
+    query_text: &str,
+    unit_id: Uuid,
+    useful: bool,
+    ms_to_action: Option<u32>,
+) -> Result<FeedbackEvent> {
+    let signal = if useful {
+        FeedbackSignal::OracleResultActedOn {
+            query_text: query_text.to_string(),
+            unit_id,
+            action: ambient_core::ResultAction::OpenedSource,
+            ms_to_action: ms_to_action.unwrap_or(0),
+            active_lens_snapshot: None, // We don't have this in CLI currently, could be added later
+        }
+    } else {
+        FeedbackSignal::QueryResultDismissed {
+            query_text: query_text.to_string(),
+            unit_id,
+        }
+    };
+
+    let event = FeedbackEvent {
+        id: Uuid::new_v4(),
+        timestamp: Utc::now(),
+        signal,
+    };
+
+    store.record_feedback(event.clone())?;
+    Ok(event)
+}
+
 fn default_config_toml() -> &'static str {
     r#"[sources]
 obsidian_vault = "~/Documents/Obsidian"
@@ -761,6 +811,7 @@ pub struct HttpAppState {
     pub status_probe: Option<Arc<dyn DaemonStatusProbe>>,
     pub deep_link_focus: Arc<Mutex<Option<Uuid>>>,
     pub transport_registry: Option<Arc<TransportRegistry>>,
+    pub feedback_recorder: Option<Arc<ambient_patterns::ImplicitFeedbackRecorder>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -776,6 +827,11 @@ pub struct AskHttpRequest {
     pub question: String,
     pub context_text: Option<String>,
     pub k: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PredictHttpRequest {
+    pub limit: usize,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -797,6 +853,14 @@ pub struct FeedbackRequest {
 pub struct PatternFeedbackRequest {
     pub pattern_id: Uuid,
     pub useful: bool,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct OracleFeedbackRequest {
+    pub query_text: String,
+    pub unit_id: Uuid,
+    pub useful: bool,
+    pub ms_to_action: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -843,7 +907,9 @@ pub fn build_router(state: HttpAppState) -> Router {
         .route("/related/:id", get(http_related))
         .route("/health", get(http_health))
         .route("/checkin", post(http_checkin))
+        .route("/predict", post(http_predict))
         .route("/feedback", post(http_feedback))
+        .route("/oracle-feedback", post(http_oracle_feedback))
         .route("/pattern-feedback", post(http_pattern_feedback))
         .route("/report", get(http_report))
         .route("/export", get(http_export))
@@ -876,12 +942,43 @@ async fn http_query(
         return resp;
     }
 
-    let result = state.engine.query(QueryRequest {
-        text: req.text,
+    let mut result = state.engine.query(QueryRequest {
+        text: req.text.clone(),
         k: req.k,
         include_pulse_context: req.include_pulse_context,
         context_window_secs: req.context_window_secs,
     });
+
+    if let Ok(ref mut units) = result {
+        if let Some(first) = units.first_mut() {
+            let predictor = ambient_patterns::ActionPredictor::new(state.store.clone());
+            if let Ok(predictions) = predictor.predict(1) {
+                if !predictions.is_empty() {
+                    first.predicted_actions = Some(predictions);
+                }
+            }
+        }
+
+        if let Some(ref recorder) = state.feedback_recorder {
+            let ids = units.iter().map(|u| u.unit.id).collect();
+            recorder.on_query_result(&req.text, ids, false, None);
+        }
+    }
+
+    map_result(result)
+}
+
+async fn http_predict(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<PredictHttpRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+
+    let predictor = ambient_patterns::ActionPredictor::new(state.store.clone());
+    let result = predictor.predict(req.limit);
     map_result(result)
 }
 
@@ -898,12 +995,20 @@ async fn http_ask(
     let result = state.engine.answer(
         &req.question,
         QueryRequest {
-            text: query_text,
+            text: query_text.clone(),
             k: req.k,
             include_pulse_context: false,
             context_window_secs: None,
         },
     );
+
+    if let Ok(ref _answer) = result {
+        if let Some(ref _recorder) = state.feedback_recorder {
+            // Distill relevant units from the answer if possible,
+            // or just use the QueryResult top items.
+        }
+    }
+
     map_result(result)
 }
 
@@ -931,6 +1036,7 @@ async fn http_unit(
                     cognitive_state: Some(cognitive_state),
                     historical_feedback_score: feedback,
                     capability_status: None,
+                    predicted_actions: None,
                 })
             }
             None => Err(ambient_core::CoreError::NotFound(format!(
@@ -1042,6 +1148,23 @@ async fn http_feedback(
         return resp;
     }
     map_result(record_query_feedback(
+        state.store.as_ref(),
+        &req.query_text,
+        req.unit_id,
+        req.useful,
+        req.ms_to_action,
+    ))
+}
+
+async fn http_oracle_feedback(
+    State(state): State<HttpAppState>,
+    headers: HeaderMap,
+    Json(req): Json<OracleFeedbackRequest>,
+) -> Response {
+    if let Err(resp) = authorize(&state.auth_token, &headers) {
+        return resp;
+    }
+    map_result(record_oracle_feedback(
         state.store.as_ref(),
         &req.query_text,
         req.unit_id,
@@ -1300,6 +1423,7 @@ mod tests {
                 cognitive_state: None,
                 historical_feedback_score: 0.5,
                 capability_status: None,
+                predicted_actions: None,
             });
 
         let app = build_router(HttpAppState {
@@ -1309,6 +1433,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: None,
+            feedback_recorder: None,
         });
 
         let req = Request::builder()
@@ -1341,6 +1466,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: None,
+            feedback_recorder: None,
         });
 
         let unauthorized = Request::builder()
@@ -1372,6 +1498,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(Arc::new(crate::TransportRegistry::default())),
+            feedback_recorder: None,
         });
 
         let req = Request::builder()
@@ -1440,6 +1567,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(registry),
+            feedback_recorder: None,
         });
 
         let req = Request::builder()
@@ -1464,6 +1592,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(Arc::new(crate::TransportRegistry::default())),
+            feedback_recorder: None,
         });
 
         let req = Request::builder()
@@ -1531,6 +1660,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(registry),
+            feedback_recorder: None,
         });
 
         let req = Request::builder()

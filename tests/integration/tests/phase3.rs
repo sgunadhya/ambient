@@ -2,7 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use ambient_cli::{build_router, run_query, HttpAppState};
-use ambient_core::{KnowledgeStore, KnowledgeUnit, QueryEngine, QueryRequest, SourceId};
+use ambient_core::{
+    KnowledgeStore, KnowledgeUnit, LensIndexStore, QueryEngine, QueryRequest, SourceId,
+};
 use ambient_query::AmbientQueryEngine;
 use ambient_store::CozoStore;
 use axum::body::{to_bytes, Body};
@@ -12,11 +14,13 @@ use tower::ServiceExt;
 
 #[test]
 fn phase3_query_engine_ranking_and_fallback() {
-    let store = Arc::new(CozoStore::new().expect("store"));
+    let store = Arc::new(CozoStore::new_for_test().expect("store"));
 
     for i in 0..10 {
         let id = uuid::Uuid::new_v4();
-        let vec = vec![i as f32, (10 - i) as f32];
+        let mut vec = vec![0.0f32; 768];
+        vec[0] = i as f32;
+        vec[1] = (10 - i) as f32;
         store
             .upsert(KnowledgeUnit {
                 id,
@@ -29,11 +33,13 @@ fn phase3_query_engine_ranking_and_fallback() {
             })
             .expect("upsert");
         store
-            .upsert_lens(id, "l1_semantic", vec)
+            .upsert_lens_vec(id, &ambient_core::LensConfig::semantic(), &vec)
             .expect("upsert lens");
     }
 
-    let engine = AmbientQueryEngine::new(store.clone(), None);
+    let retrievers: Vec<Arc<dyn ambient_core::LensRetriever>> =
+        vec![Arc::new(ambient_query::FtsRetriever::new(store.clone()))];
+    let engine = AmbientQueryEngine::new(store.clone(), None, retrievers);
 
     let direct = engine
         .query(QueryRequest {
@@ -50,7 +56,7 @@ fn phase3_query_engine_ranking_and_fallback() {
     assert_eq!(cli.len(), direct.len());
 
     // FTS fallback path: no embeddings.
-    let store_no_embeddings = Arc::new(CozoStore::new().expect("store"));
+    let store_no_embeddings = Arc::new(CozoStore::new_for_test().expect("store"));
     store_no_embeddings
         .upsert(KnowledgeUnit {
             id: uuid::Uuid::new_v4(),
@@ -62,7 +68,10 @@ fn phase3_query_engine_ranking_and_fallback() {
             content_hash: [7; 32],
         })
         .expect("upsert");
-    let fallback_engine = AmbientQueryEngine::new(store_no_embeddings, None);
+    let fallback_retrievers: Vec<Arc<dyn ambient_core::LensRetriever>> = vec![Arc::new(
+        ambient_query::FtsRetriever::new(store_no_embeddings.clone()),
+    )];
+    let fallback_engine = AmbientQueryEngine::new(store_no_embeddings, None, fallback_retrievers);
     let fallback = fallback_engine
         .query(QueryRequest {
             text: "fallback".to_string(),
@@ -81,6 +90,7 @@ fn phase3_query_engine_ranking_and_fallback() {
         status_probe: None,
         deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
         transport_registry: None,
+        feedback_recorder: None,
     });
     let request = Request::builder()
         .method("POST")

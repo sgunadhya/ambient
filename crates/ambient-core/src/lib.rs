@@ -213,6 +213,14 @@ impl Default for QueryRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PredictedAction {
+    pub rule_id: Uuid,
+    pub action_payload: serde_json::Value,
+    pub confidence: f32,
+    pub trigger_reason: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueryResult {
     pub unit: KnowledgeUnit,
     pub score: f32,
@@ -220,6 +228,7 @@ pub struct QueryResult {
     pub cognitive_state: Option<CognitiveState>,
     pub historical_feedback_score: f32,
     pub capability_status: Option<CapabilityStatus>,
+    pub predicted_actions: Option<Vec<PredictedAction>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -384,6 +393,83 @@ pub trait Normalizer: Send + Sync {
     fn normalize(&self, event: RawEvent) -> Result<KnowledgeUnit>;
 }
 
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IndexBackend {
+    Hnsw,
+    Flat,
+}
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LensId {
+    L1Semantic,
+    L2Technical,
+    L3Fulltext,
+    L4Temporal,
+    L5Social,
+}
+
+impl LensId {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            LensId::L1Semantic => "l1_semantic",
+            LensId::L2Technical => "l2_technical",
+            LensId::L3Fulltext => "l3_fulltext",
+            LensId::L4Temporal => "l4_temporal",
+            LensId::L5Social => "l5_social",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LensConfig {
+    pub id: LensId,
+    pub dimensions: usize,
+    pub model_name: String,
+    pub index_backend: IndexBackend,
+}
+
+impl LensConfig {
+    pub fn semantic() -> Self {
+        Self {
+            id: LensId::L1Semantic,
+            dimensions: 768,
+            model_name: "nomic-embed-text".to_string(),
+            index_backend: IndexBackend::Hnsw,
+        }
+    }
+
+    pub fn technical() -> Self {
+        Self {
+            id: LensId::L2Technical,
+            dimensions: 768,
+            model_name: "jina-embeddings-v2-base-code".to_string(),
+            index_backend: IndexBackend::Hnsw,
+        }
+    }
+
+    pub fn social() -> Self {
+        Self {
+            id: LensId::L5Social,
+            dimensions: 384,
+            model_name: "gte-small".to_string(),
+            index_backend: IndexBackend::Hnsw,
+        }
+    }
+}
+
+pub trait LensIndexStore: Send + Sync {
+    fn upsert_lens_vec(&self, unit_id: Uuid, lens: &LensConfig, vec: &[f32]) -> Result<()>;
+    fn search_lens_vec(&self, lens: &LensConfig, query_vec: &[f32], k: usize) -> Result<Vec<Uuid>>;
+    fn get_all_lens_vectors(&self, lens: &LensConfig) -> Result<Vec<(Uuid, Vec<f32>)>>;
+}
+
+pub trait LensRetriever: Send + Sync {
+    fn config(&self) -> Option<&LensConfig>;
+    fn retrieve(&self, request: &QueryRequest) -> Result<Vec<Uuid>>;
+}
+
 pub trait KnowledgeStore: Send + Sync {
     fn upsert(&self, unit: KnowledgeUnit) -> Result<()>;
     fn search_semantic(&self, query_vec: &[f32], k: usize) -> Result<Vec<KnowledgeUnit>>;
@@ -416,24 +502,16 @@ pub trait KnowledgeStore: Send + Sync {
     fn record_feedback(&self, event: FeedbackEvent) -> Result<()>;
     fn feedback_score(&self, unit_id: Uuid) -> Result<f32>;
     fn pattern_feedback(&self, pattern_id: Uuid) -> Result<Option<String>>;
-
-    /// Write a lens vector for a unit into the disjoint lens_map store.
-    /// `lens_id` is one of: "l1_semantic", "l2_technical", "l5_social".
-    fn upsert_lens(&self, unit_id: Uuid, lens_id: &str, vec: Vec<f32>) -> Result<()>;
-
-    /// Retrieve the top-k units by cosine similarity within a specific lens.
-    fn search_lens(&self, lens_id: &str, query_vec: &[f32], k: usize)
-        -> Result<Vec<KnowledgeUnit>>;
-
     fn save_rule(&self, rule: ProceduralRule) -> Result<()>;
     fn get_active_rules_for_pulse(&self, pulse_mask: &str) -> Result<Vec<ProceduralRule>>;
+    fn get_all_rules(&self) -> Result<Vec<ProceduralRule>>;
+
+    /// Retrieve the most recent N cognitive snapshots.
+    fn get_recent_snapshots(&self, limit: usize) -> Result<Vec<(Uuid, CognitiveState)>>;
 
     /// Re-calculate and update the temporal profiles for units based on pulse history.
     fn calculate_temporal_profile(&self, unit_id: Uuid) -> Result<()>;
     fn get_temporal_profile(&self, unit_id: Uuid) -> Result<Option<TemporalProfile>>;
-
-    /// Batch retrieval of lens vectors for clustering.
-    fn get_all_lens_vectors(&self, lens_id: &str) -> Result<Vec<(Uuid, Vec<f32>)>>;
 }
 
 pub trait ReasoningEngine: Send + Sync {
@@ -902,19 +980,6 @@ pub mod mocks {
             Ok(None)
         }
 
-        fn upsert_lens(&self, _unit_id: Uuid, _lens_id: &str, _vec: Vec<f32>) -> Result<()> {
-            Ok(())
-        }
-
-        fn search_lens(
-            &self,
-            _lens_id: &str,
-            _query_vec: &[f32],
-            k: usize,
-        ) -> Result<Vec<crate::KnowledgeUnit>> {
-            self.search_semantic(_query_vec, k)
-        }
-
         fn calculate_temporal_profile(&self, _unit_id: Uuid) -> Result<()> {
             Ok(())
         }
@@ -934,7 +999,11 @@ pub mod mocks {
             Ok(Vec::new())
         }
 
-        fn get_all_lens_vectors(&self, _lens_id: &str) -> Result<Vec<(Uuid, Vec<f32>)>> {
+        fn get_all_rules(&self) -> Result<Vec<crate::ProceduralRule>> {
+            Ok(Vec::new())
+        }
+
+        fn get_recent_snapshots(&self, _limit: usize) -> Result<Vec<(Uuid, CognitiveState)>> {
             Ok(Vec::new())
         }
     }

@@ -6,7 +6,7 @@ use chrono::Utc;
 
 #[test]
 fn phase2_unit_with_context_derives_state() {
-    let store = CozoStore::new().expect("store");
+    let store = CozoStore::new_for_test().expect("store");
     let observed_at = Utc::now();
     let id = uuid::Uuid::new_v4();
 

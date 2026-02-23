@@ -4,8 +4,9 @@ use std::thread;
 use std::time::Duration;
 
 use ambient_core::{
-    CoreError, EventLogEntry, KnowledgeConsumer, KnowledgeStore, KnowledgeUnit, LoadAware,
-    RawPayload, ReasoningBackend, ReasoningEngine, Result, StreamProvider, SystemLoad,
+    CoreError, EventLogEntry, KnowledgeConsumer, KnowledgeStore, KnowledgeUnit, LensConfig, LensId,
+    LensIndexStore, LoadAware, RawPayload, ReasoningBackend, ReasoningEngine, Result,
+    StreamProvider, SystemLoad, Uuid,
 };
 use ambient_lenses::{LensRouter, MultiLensRouter};
 use rig::client::{CompletionClient, EmbeddingsClient, Nothing};
@@ -251,6 +252,7 @@ impl ReasoningEngine for RigReasoningEngine {
 pub struct LensConsumer {
     consumer: KnowledgeConsumer,
     store: Arc<dyn KnowledgeStore>,
+    index_store: Arc<dyn LensIndexStore>,
     router: Arc<dyn LensRouter>,
     paused: Arc<AtomicBool>,
 }
@@ -259,6 +261,7 @@ impl LensConsumer {
     pub fn new(
         provider: Arc<dyn StreamProvider>,
         store: Arc<dyn KnowledgeStore>,
+        index_store: Arc<dyn LensIndexStore>,
         reasoning: Arc<dyn ReasoningEngine>,
         consumer_id: String,
     ) -> Result<Self> {
@@ -267,6 +270,7 @@ impl LensConsumer {
         Ok(Self {
             consumer,
             store,
+            index_store,
             router,
             paused: Arc::new(AtomicBool::new(false)),
         })
@@ -295,7 +299,13 @@ impl LensConsumer {
 
                         if let Ok(embeddings) = rt.block_on(worker.router.embed_all(&unit)) {
                             for (lens_id, vec) in embeddings {
-                                let _ = worker.store.upsert_lens(unit.id, lens_id.as_str(), vec);
+                                let config = match lens_id {
+                                    LensId::L1Semantic => LensConfig::semantic(),
+                                    LensId::L2Technical => LensConfig::technical(),
+                                    LensId::L5Social => LensConfig::social(),
+                                    _ => continue,
+                                };
+                                let _ = worker.index_store.upsert_lens_vec(unit.id, &config, &vec);
                             }
                         }
 

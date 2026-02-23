@@ -181,6 +181,10 @@ enum Commands {
     Ask {
         question: String,
     },
+    Predict {
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+    },
     Unit {
         id: Uuid,
         #[arg(long, default_value_t = 3600)]
@@ -203,6 +207,16 @@ enum Commands {
         note: Option<String>,
     },
     Feedback {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        unit_id: Uuid,
+        #[arg(long)]
+        useful: bool,
+        #[arg(long)]
+        ms_to_action: Option<u32>,
+    },
+    AskFeedback {
         #[arg(long)]
         query: String,
         #[arg(long)]
@@ -295,7 +309,7 @@ fn run() -> Result<(), String> {
             );
             reasoning.start_ollama_probe();
 
-            let (engine, store) = build_runtime_components_with_weights(
+            let (engine, store, index_store) = build_runtime_components_with_weights(
                 config.semantic_weight,
                 config.feedback_weight,
                 Some(reasoning.clone()),
@@ -310,6 +324,7 @@ fn run() -> Result<(), String> {
                 LensConsumer::new(
                     stream_provider.clone(),
                     store.clone(),
+                    index_store.clone(),
                     reasoning.clone(),
                     "lens_indexer".to_string(),
                 )
@@ -338,7 +353,17 @@ fn run() -> Result<(), String> {
             );
             let _ = triggers.start_watch(trigger_path);
             let report_dir = default_report_dir()?;
-            PatternScheduler::new(store.clone(), reasoning.clone(), report_dir).start();
+            PatternScheduler::new(
+                store.clone(),
+                index_store.clone(),
+                reasoning.clone(),
+                report_dir,
+            )
+            .start();
+
+            let feedback_recorder = Arc::new(ambient_patterns::ImplicitFeedbackRecorder::new(
+                store.clone(),
+            ));
 
             let mut active_sources = vec!["obsidian".to_string()];
             if config.spotlight {
@@ -396,12 +421,17 @@ fn run() -> Result<(), String> {
             }
             let pulse_provider = stream_provider.clone();
             let pulse_store = store.clone();
+            let feedback_recorder_pulse = feedback_recorder.clone();
             std::thread::spawn(move || {
-                let consumer =
-                    match PulseConsumer::new(pulse_provider, pulse_store, "pulse".to_string()) {
-                        Ok(c) => c,
-                        Err(_) => return,
-                    };
+                let consumer = match PulseConsumer::new(
+                    pulse_provider,
+                    pulse_store,
+                    "pulse".to_string(),
+                    Some(feedback_recorder_pulse),
+                ) {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
                 loop {
                     let count = consumer.poll_once(200).unwrap_or(0);
                     if count == 0 {
@@ -449,6 +479,7 @@ fn run() -> Result<(), String> {
                     })),
                     deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
                     transport_registry: Some(transport_registry.clone()),
+                    feedback_recorder: Some(feedback_recorder),
                 },
             ));
             let stop_result = transport_registry.stop_all().map_err(|e| e.to_string());
@@ -477,6 +508,12 @@ fn run() -> Result<(), String> {
                 "k": 5
             });
             post_json(&cli.server, cli.token.as_deref(), "/ask", &body)
+        }
+        Commands::Predict { limit } => {
+            let body = serde_json::json!({
+                "limit": limit
+            });
+            post_json(&cli.server, cli.token.as_deref(), "/predict", &body)
         }
         Commands::Unit { id, window } => get(
             &cli.server,
@@ -532,6 +569,20 @@ fn run() -> Result<(), String> {
                 "ms_to_action": ms_to_action
             });
             post_json(&cli.server, cli.token.as_deref(), "/feedback", &body)
+        }
+        Commands::AskFeedback {
+            query,
+            unit_id,
+            useful,
+            ms_to_action,
+        } => {
+            let body = serde_json::json!({
+                "query_text": query,
+                "unit_id": unit_id,
+                "useful": useful,
+                "ms_to_action": ms_to_action
+            });
+            post_json(&cli.server, cli.token.as_deref(), "/oracle-feedback", &body)
         }
         Commands::Export { format } => export_data(&cli.server, cli.token.as_deref(), &format),
         Commands::OpenUrl { url } => open_url(&cli.server, cli.token.as_deref(), &url),

@@ -1,30 +1,7 @@
-use ambient_core::{KnowledgeUnit, ReasoningEngine, Result};
+use ambient_core::{KnowledgeUnit, LensId, ReasoningEngine, Result};
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-
-#[derive(Debug, Clone, Hash, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LensId {
-    L1Semantic,
-    L2Technical,
-    L3Fulltext,
-    L4Temporal,
-    L5Social,
-}
-
-impl LensId {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            LensId::L1Semantic => "l1_semantic",
-            LensId::L2Technical => "l2_technical",
-            LensId::L3Fulltext => "l3_fulltext",
-            LensId::L4Temporal => "l4_temporal",
-            LensId::L5Social => "l5_social",
-        }
-    }
-}
 
 #[async_trait]
 pub trait LensRouter: Send + Sync {

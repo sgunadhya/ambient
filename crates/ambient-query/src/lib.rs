@@ -1,16 +1,73 @@
 use std::sync::Arc;
 
 use ambient_core::{
-    CapabilityGate, CapabilityStatus, CoreError, GatedCapability, KnowledgeStore, QueryEngine,
-    QueryRequest, QueryResult, ReasoningEngine, Result, Uuid,
+    CapabilityGate, CapabilityStatus, CoreError, GatedCapability, KnowledgeStore, LensConfig,
+    LensId, LensIndexStore, LensRetriever, QueryEngine, QueryRequest, QueryResult, ReasoningEngine,
+    Result, Uuid,
 };
 use ambient_store::CozoStore;
 use chrono::{Datelike, Timelike};
+
+pub struct VectorLensRetriever {
+    config: LensConfig,
+    index_store: Arc<dyn LensIndexStore>,
+    reasoning: Arc<dyn ReasoningEngine>,
+}
+
+impl VectorLensRetriever {
+    pub fn new(
+        config: LensConfig,
+        index_store: Arc<dyn LensIndexStore>,
+        reasoning: Arc<dyn ReasoningEngine>,
+    ) -> Self {
+        Self {
+            config,
+            index_store,
+            reasoning,
+        }
+    }
+}
+
+impl LensRetriever for VectorLensRetriever {
+    fn config(&self) -> Option<&LensConfig> {
+        Some(&self.config)
+    }
+
+    fn retrieve(&self, request: &QueryRequest) -> Result<Vec<Uuid>> {
+        let vec = self
+            .reasoning
+            .embed_with_model(&request.text, &self.config.model_name)?;
+        self.index_store
+            .search_lens_vec(&self.config, &vec, request.k * 2)
+    }
+}
+
+pub struct FtsRetriever {
+    store: Arc<dyn KnowledgeStore>,
+}
+
+impl FtsRetriever {
+    pub fn new(store: Arc<dyn KnowledgeStore>) -> Self {
+        Self { store }
+    }
+}
+
+impl LensRetriever for FtsRetriever {
+    fn config(&self) -> Option<&LensConfig> {
+        None
+    }
+
+    fn retrieve(&self, request: &QueryRequest) -> Result<Vec<Uuid>> {
+        let units = self.store.search_fulltext(&request.text)?;
+        Ok(units.into_iter().map(|u| u.id).collect())
+    }
+}
 
 pub struct AmbientQueryEngine {
     store: Arc<dyn KnowledgeStore>,
     reasoning: Option<Arc<dyn ReasoningEngine>>,
     gate: Option<Arc<dyn CapabilityGate>>,
+    retrievers: Vec<Arc<dyn LensRetriever>>,
     semantic_weight: f32,
     feedback_weight: f32,
 }
@@ -19,11 +76,13 @@ impl AmbientQueryEngine {
     pub fn new(
         store: Arc<dyn KnowledgeStore>,
         reasoning: Option<Arc<dyn ReasoningEngine>>,
+        retrievers: Vec<Arc<dyn LensRetriever>>,
     ) -> Self {
         Self {
             store,
             reasoning,
             gate: None,
+            retrievers,
             semantic_weight: 0.7,
             feedback_weight: 0.3,
         }
@@ -81,11 +140,8 @@ impl AmbientQueryEngine {
             return Ok(None);
         };
 
-        let vec = reasoning.embed(&req.text).unwrap_or_default();
-        let units = self
-            .store
-            .search_semantic(&vec, req.k)
-            .or_else(|_| self.store.search_fulltext(&req.text))?;
+        let results = self.query(req.clone()).unwrap_or_default();
+        let units: Vec<_> = results.into_iter().map(|r| r.unit).collect();
 
         let response = reasoning.answer(question, &units)?;
         Ok(Some(response))
@@ -96,33 +152,16 @@ impl QueryEngine for AmbientQueryEngine {
     fn query(&self, req: QueryRequest) -> Result<Vec<QueryResult>> {
         let mut rank_lists = Vec::new();
 
-        // 1. L1: Semantic retrieval
-        if self.semantic_allowed() {
-            if let Some(reasoning) = self.reasoning.as_ref() {
-                if let Ok(vec) = reasoning.embed_with_model(&req.text, "nomic-embed-text") {
-                    if let Ok(units) = self.store.search_lens("l1_semantic", &vec, req.k * 2) {
-                        rank_lists.push(units.into_iter().map(|u| u.id).collect::<Vec<_>>());
-                    }
+        for retriever in &self.retrievers {
+            if retriever.config().is_some() && !self.semantic_allowed() {
+                continue; // Skip vector searches if semantic intelligence is disabled
+            }
+
+            if let Ok(ids) = retriever.retrieve(&req) {
+                if !ids.is_empty() {
+                    rank_lists.push(ids);
                 }
             }
-        }
-
-        // 2. L2: Technical retrieval
-        if self.semantic_allowed() {
-            if let Some(reasoning) = self.reasoning.as_ref() {
-                if let Ok(vec) =
-                    reasoning.embed_with_model(&req.text, "jina-embeddings-v2-base-code")
-                {
-                    if let Ok(units) = self.store.search_lens("l2_technical", &vec, req.k * 2) {
-                        rank_lists.push(units.into_iter().map(|u| u.id).collect::<Vec<_>>());
-                    }
-                }
-            }
-        }
-
-        // 3. L3: FTS (Keyword) retrieval
-        if let Ok(units) = self.store.search_fulltext(&req.text) {
-            rank_lists.push(units.into_iter().map(|u| u.id).collect::<Vec<_>>());
         }
 
         // 4. Fusion via RRF
@@ -195,6 +234,7 @@ impl QueryEngine for AmbientQueryEngine {
                 cognitive_state,
                 historical_feedback_score: feedback_score,
                 capability_status: cap.clone(),
+                predicted_actions: None,
             });
         }
 
@@ -219,7 +259,11 @@ impl QueryEngine for AmbientQueryEngine {
 
 pub fn build_runtime_components(
     reasoning: Option<Arc<dyn ReasoningEngine>>,
-) -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
+) -> Result<(
+    Arc<dyn QueryEngine>,
+    Arc<dyn KnowledgeStore>,
+    Arc<dyn LensIndexStore>,
+)> {
     build_runtime_components_with_weights(0.7, 0.3, reasoning)
 }
 
@@ -227,11 +271,34 @@ pub fn build_runtime_components_with_weights(
     semantic_weight: f32,
     feedback_weight: f32,
     reasoning: Option<Arc<dyn ReasoningEngine>>,
-) -> Result<(Arc<dyn QueryEngine>, Arc<dyn KnowledgeStore>)> {
-    let store: Arc<dyn KnowledgeStore> = Arc::new(CozoStore::new()?);
+) -> Result<(
+    Arc<dyn QueryEngine>,
+    Arc<dyn KnowledgeStore>,
+    Arc<dyn LensIndexStore>,
+)> {
+    let cozo = Arc::new(CozoStore::new()?);
+    let store: Arc<dyn KnowledgeStore> = cozo.clone();
+    let index_store: Arc<dyn LensIndexStore> = cozo;
+
+    let mut retrievers: Vec<Arc<dyn LensRetriever>> =
+        vec![Arc::new(FtsRetriever::new(store.clone()))];
+
+    if let Some(r) = reasoning.as_ref() {
+        retrievers.push(Arc::new(VectorLensRetriever::new(
+            LensConfig::semantic(),
+            index_store.clone(),
+            r.clone(),
+        )));
+        retrievers.push(Arc::new(VectorLensRetriever::new(
+            LensConfig::technical(),
+            index_store.clone(),
+            r.clone(),
+        )));
+    }
+
     let engine: Arc<dyn QueryEngine> = Arc::new(
-        AmbientQueryEngine::new(store.clone(), reasoning)
+        AmbientQueryEngine::new(store.clone(), reasoning, retrievers)
             .with_weights(semantic_weight, feedback_weight),
     );
-    Ok((engine, store))
+    Ok((engine, store, index_store))
 }

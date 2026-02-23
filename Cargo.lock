@@ -187,6 +187,7 @@ dependencies = [
  "ndarray 0.17.2",
  "petal-clustering",
  "petal-neighbors",
+ "serde",
  "serde_json",
  "uuid",
 ]
