@@ -1,0 +1,54 @@
+[package]
+name = "graph_builder"
+version = "0.3.1"
+description = "A building block for high-performant graph algorithms."
+keywords = ["graph", "builder", "csr", "algorithms"]
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+atoi.workspace = true
+atomic.workspace = true
+byte-slice-cast.workspace = true
+dashmap.workspace = true
+delegate.workspace = true
+fast-float.workspace = true
+fxhash.workspace = true
+gdl = { workspace = true, optional = true }
+linereader.workspace = true
+log.workspace = true
+memmap2.workspace = true
+num.workspace = true
+num-format.workspace = true
+num_cpus.workspace = true
+page_size.workspace = true
+parking_lot.workspace = true
+rayon.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+rand.workspace = true
+tempfile.workspace = true
+
+[features]
+force_fallback_impl = []
+dotgraph = []
+
+[[bench]]
+name = "edgelist"
+harness = false
+
+[[bench]]
+name = "csr"
+harness = false
+
+[[bench]]
+name = "dotgraph"
+harness = false
+
+[package.metadata.docs.rs]
+features = ["gdl", "dotgraph"]

@@ -153,7 +153,9 @@ impl CozoStore {
             .run_script(fts_schema, BTreeMap::new(), ScriptMutability::Mutable)
         {
             let err_str = e.to_string();
-            if !err_str.contains("conflicts with an existing one") {
+            if !err_str.contains("conflicts with an existing one")
+                && !err_str.contains("already exists")
+            {
                 error!("FTS schema init error: {}", e);
             }
         }

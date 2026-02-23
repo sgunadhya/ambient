@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 ambient-core = { path = "../ambient-core" }
 ambient-lenses = { path = "../ambient-lenses" }
+fastembed = "5"
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"] }
 rig-core = "0.31"
 tokio = { version = "1", features = ["rt-multi-thread"] }

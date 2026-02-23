@@ -21,3 +21,6 @@ members = [
   "crates/ambient-cli",
   "tests/integration", "crates/ambient-lenses",
 ]
+
+[patch.crates-io]
+graph_builder = { path = "vendor/graph_builder" }

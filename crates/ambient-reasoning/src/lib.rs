@@ -9,9 +9,9 @@ use ambient_core::{
     StreamProvider, SystemLoad,
 };
 use ambient_lenses::{LensRouter, MultiLensRouter};
-use rig::client::{CompletionClient, EmbeddingsClient, Nothing};
+use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
+use rig::client::{CompletionClient, Nothing};
 use rig::completion::Prompt;
-use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
 use rig::providers::{ollama, openai};
 use tracing::{debug, error, info, instrument, warn};
 
@@ -22,6 +22,7 @@ pub struct RigReasoningEngine {
     embedding_model_name: String,
     completion_model_name: String,
     reasoning_available: Arc<AtomicBool>,
+    fastembed: std::sync::Mutex<Option<TextEmbedding>>,
 }
 
 impl RigReasoningEngine {
@@ -57,9 +58,10 @@ impl RigReasoningEngine {
             backend,
             ollama_client,
             openai_client,
-            embedding_model_name: ollama::NOMIC_EMBED_TEXT.to_string(),
+            embedding_model_name: "nomic-embed-text-v1.5".to_string(),
             completion_model_name: ollama::LLAMA3_2.to_string(),
             reasoning_available: Arc::new(AtomicBool::new(true)),
+            fastembed: std::sync::Mutex::new(None),
         }
     }
 
@@ -123,70 +125,52 @@ impl ReasoningEngine for RigReasoningEngine {
     }
 
     #[instrument(skip(self))]
-    fn embed_with_model(&self, text: &str, model: &str) -> Result<Vec<f32>> {
+    fn embed_with_model(&self, text: &str, _model: &str) -> Result<Vec<f32>> {
         debug!(
             text_len = text.len(),
-            model = model,
-            "requesting embedding from backend"
+            "requesting offline embedding from fastembed"
         );
-        if !self.reasoning_available() {
-            return Err(CoreError::Unsupported("reasoning backend unavailable"));
+
+        let mut lock = self
+            .fastembed
+            .lock()
+            .map_err(|_| CoreError::Internal("fastembed lock poisoned".to_string()))?;
+        if lock.is_none() {
+            info!("initializing fastembed runtime (may download weights on first run)...");
+            let mut options = InitOptions::new(EmbeddingModel::NomicEmbedTextV15);
+            options.show_download_progress = true;
+            info!("Calling TextEmbedding::try_new with options: {:?}", options);
+            let embedder_result = TextEmbedding::try_new(options);
+            info!(
+                "TextEmbedding::try_new returned: {:?}",
+                embedder_result.is_ok()
+            );
+            let embedder = embedder_result
+                .map_err(|e| CoreError::Internal(format!("failed to init fastembed: {e}")))?;
+            info!("Successfully initialized FastEmbed. Caching in mutex...");
+            *lock = Some(embedder);
         }
 
-        let model_name = model.to_string();
-        let text = text.to_string();
-        let (tx, rx) = mpsc::channel();
+        info!("FastEmbed initialized, requesting embedding for text...");
+        let embeddings_result = lock.as_mut().unwrap().embed(vec![text], None);
+        info!(
+            "FastEmbed embed() completed with result: {:?}",
+            embeddings_result.is_ok()
+        );
 
-        if let Some(client) = &self.ollama_client {
-            let client = client.clone();
-            thread::spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
-                    .and_then(|rt| {
-                        rt.block_on(async move {
-                            let model = client.embedding_model_with_ndims(model_name, 768);
-                            let embedding = model.embed_text(&text).await.map_err(|e| {
-                                CoreError::Internal(format!("ollama embedding failed: {e}"))
-                            })?;
-                            Ok(embedding
-                                .vec
-                                .into_iter()
-                                .map(|v| v as f32)
-                                .collect::<Vec<f32>>())
-                        })
-                    });
-                let _ = tx.send(result);
-            });
-        } else if let Some(client) = &self.openai_client {
-            let client = client.clone();
-            thread::spawn(move || {
-                let result = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|e| CoreError::Internal(format!("tokio runtime init failed: {e}")))
-                    .and_then(|rt| {
-                        rt.block_on(async move {
-                            let model = client.embedding_model(model_name);
-                            let embedding = model.embed_text(&text).await.map_err(|e| {
-                                CoreError::Internal(format!("openai embedding failed: {e}"))
-                            })?;
-                            Ok(embedding
-                                .vec
-                                .into_iter()
-                                .map(|v| v as f32)
-                                .collect::<Vec<f32>>())
-                        })
-                    });
-                let _ = tx.send(result);
-            });
-        } else {
-            return Err(CoreError::Unsupported("no reasoning client available"));
-        }
+        let embeddings =
+            embeddings_result.map_err(|e| CoreError::Internal(format!("fastembed failed: {e}")))?;
 
-        rx.recv_timeout(Duration::from_secs(30))
-            .map_err(|_| CoreError::Internal("embedding timed out after 30s".to_string()))?
+        let embedding = embeddings
+            .into_iter()
+            .next()
+            .ok_or_else(|| CoreError::Internal("fastembed returned empty result".to_string()))?;
+
+        info!(
+            "Successfully derived embedding vector of length {}",
+            embedding.len()
+        );
+        Ok(embedding)
     }
 
     #[instrument(skip(self, context))]
