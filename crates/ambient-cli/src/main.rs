@@ -468,6 +468,7 @@ fn run() -> Result<(), String> {
                 HttpAppState {
                     engine,
                     store,
+                    config: Arc::new(config.clone()),
                     auth_token: config.auth_token.clone(),
                     status_probe: Some(Arc::new(RuntimeStatusProbe {
                         reasoning,

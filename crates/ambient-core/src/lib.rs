@@ -1493,3 +1493,86 @@ pub mod mocks {
         };
     }
 }
+
+// ==========================================
+// Phase 9: Rule Engine & Noticer Policy Architecture
+// ==========================================
+
+// --- Rule Engine Traits ---
+
+#[derive(Debug, Clone)]
+pub struct PulseSnapshot {
+    pub current: CognitiveState,
+    pub history: Vec<CognitiveState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EvalContext {
+    pub rule: ProceduralRule,
+    pub snapshot: PulseSnapshot,
+}
+
+pub trait PulseMatcher: Send + Sync {
+    fn candidates(
+        &self,
+        store: &dyn KnowledgeStore,
+        pulse: &PulseSnapshot,
+    ) -> Result<Vec<ProceduralRule>>;
+}
+
+pub trait IntentScorer: Send + Sync {
+    fn score(&self, current_lens: &[f32], rule: &ProceduralRule) -> f32;
+}
+
+pub trait ThresholdPolicy: Send + Sync {
+    fn threshold(&self, rule: &ProceduralRule, ctx: &EvalContext) -> f32;
+}
+
+pub trait RuleExecutor: Send + Sync {
+    fn execute(&self, rule: &ProceduralRule) -> Result<()>;
+}
+
+// --- Noticer Pipeline Traits ---
+
+#[derive(Debug, Clone)]
+pub struct NoticerState {
+    pub last_run: Option<DateTime<Utc>>,
+    pub new_events_count: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct Candidate {
+    pub unit_id: Uuid,
+    pub vector: Vec<f32>,
+    pub cognitive_state: Option<CognitiveState>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Cluster {
+    pub centroid: Vec<f32>,
+    pub candidate_ids: Vec<Uuid>,
+}
+
+pub trait DiscoveryTrigger: Send + Sync {
+    fn should_run(&self, state: &NoticerState) -> bool;
+}
+
+pub trait CandidateSelector: Send + Sync {
+    fn select(
+        &self,
+        store: &dyn KnowledgeStore,
+        index: &dyn LensIndexStore,
+    ) -> Result<Vec<Candidate>>;
+}
+
+pub trait Clusterer: Send + Sync {
+    fn cluster(&self, vecs: &[Vec<f32>]) -> Result<Vec<Cluster>>;
+}
+
+pub trait RuleSynthesizer: Send + Sync {
+    fn synthesize(&self, cluster: &Cluster, units: &[KnowledgeUnit]) -> Result<ProceduralRule>;
+}
+
+pub trait RulePublisher: Send + Sync {
+    fn publish(&self, rule: ProceduralRule, store: &dyn KnowledgeStore) -> Result<()>;
+}

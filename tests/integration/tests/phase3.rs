@@ -86,6 +86,7 @@ fn phase3_query_engine_ranking_and_fallback() {
     let app = build_router(HttpAppState {
         engine: Arc::new(engine),
         store: store.clone(),
+        config: Arc::new(ambient_cli::AmbientConfig::default()),
         auth_token: None,
         status_probe: None,
         deep_link_focus: Arc::new(std::sync::Mutex::new(None)),

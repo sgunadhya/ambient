@@ -15,62 +15,55 @@ use std::time::{Duration, Instant};
 
 use ambient_core::{
     CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore, KnowledgeUnit,
-    PredictedAction, QueryRequest, QueryResult, Result, ResultAction, SourceId, Uuid,
+    NoticerState, PredictedAction, PulseSnapshot, QueryRequest, QueryResult, Result, ResultAction,
+    SourceId, Uuid,
 };
 use chrono::{Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
-use ndarray::Array2;
-use petal_clustering::{Dbscan, Fit};
-use petal_neighbors::distance::Euclidean;
+pub mod noticer_pipeline;
+pub use noticer_pipeline::*;
+
+pub mod rule_engine;
+pub use rule_engine::*;
 
 pub struct ActionPredictor {
     store: Arc<dyn KnowledgeStore>,
+    engine: Arc<RuleEngine>,
 }
 
 impl ActionPredictor {
-    pub fn new(store: Arc<dyn KnowledgeStore>) -> Self {
-        Self { store }
+    pub fn new(store: Arc<dyn KnowledgeStore>, engine: Arc<RuleEngine>) -> Self {
+        Self { store, engine }
     }
 
     pub fn predict(&self, limit: usize) -> Result<Vec<PredictedAction>> {
         let snapshots = self.store.get_recent_snapshots(limit)?;
-        let rules = self.store.get_all_rules()?;
+        if snapshots.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let history: Vec<_> = snapshots.iter().skip(1).map(|(_, s)| s.clone()).collect();
+        let pulse = PulseSnapshot {
+            current: snapshots[0].1.clone(),
+            history,
+        };
+
+        let current_lens: Vec<f32> = Vec::new(); // Mvp behavior uses empty lens context
+        let passed = self
+            .engine
+            .evaluate(self.store.as_ref(), &pulse, &current_lens)?;
 
         let mut predictions = Vec::new();
-
-        for rule in rules {
-            // 1. Check Pulse Mask
-            // For now, if pulse_mask is specified, we check if it matches the latest dominant_app
-            let pulse_match = if rule.pulse_mask.is_empty() {
-                true
-            } else {
-                snapshots.first()
-                    .map(|(_, s)| s.dominant_app.as_deref() == Some(&rule.pulse_mask))
-                    .unwrap_or(false)
-            };
-
-            if !pulse_match {
-                continue;
-            }
-
-            // 2. Check Context (Simplified)
-            // If the rule has no lens_intent, we treat it as a pure pulse-triggered rule
-            let score = if rule.lens_intent.is_empty() {
-                1.0
-            } else {
-                // Future: implementation of lens-based intent matching
-                // For now, if it matched pulse, we give it a baseline
-                0.8
-            };
-
-            if score >= rule.threshold {
-                predictions.push(PredictedAction {
-                    rule_id: rule.id,
-                    action_payload: rule.action_payload.clone(),
-                    confidence: score,
-                    trigger_reason: format!("Matches pulse mask: {}", rule.pulse_mask),
-                });
-            }
+        for (rule, score) in passed {
+            predictions.push(PredictedAction {
+                rule_id: rule.id,
+                action_payload: rule.action_payload.clone(),
+                confidence: score,
+                trigger_reason: format!(
+                    "Action prediction pipeline output. Matched intent & mask: {}",
+                    rule.pulse_mask
+                ),
+            });
         }
 
         Ok(predictions)
@@ -509,9 +502,17 @@ impl PatternScheduler {
         reasoner: Arc<dyn ambient_core::ReasoningEngine>,
         report_dir: PathBuf,
     ) -> Self {
+        let noticer_engine = Arc::new(NoticerEngine::new(
+            Arc::new(MvpDiscoveryTrigger),
+            Arc::new(MvpCandidateSelector),
+            Arc::new(MvpClusterer),
+            Arc::new(MvpRuleSynthesizer::new(reasoner.clone())),
+            Arc::new(MvpRulePublisher),
+        ));
+
         Self {
             detector: PatternDetector::new(store.clone()),
-            noticer: NoticerConsumer::new(store, index_store, reasoner),
+            noticer: NoticerConsumer::new(store, index_store, noticer_engine),
             probe: Arc::new(DefaultSchedulerProbe),
             poll_interval: Duration::from_secs(60),
             report_dir,
@@ -598,97 +599,31 @@ impl PatternScheduler {
 pub struct NoticerConsumer {
     store: Arc<dyn KnowledgeStore>,
     index_store: Arc<dyn ambient_core::LensIndexStore>,
-    reasoner: Arc<dyn ambient_core::ReasoningEngine>,
+    engine: Arc<NoticerEngine>,
 }
 
 impl NoticerConsumer {
     pub fn new(
         store: Arc<dyn KnowledgeStore>,
         index_store: Arc<dyn ambient_core::LensIndexStore>,
-        reasoner: Arc<dyn ambient_core::ReasoningEngine>,
+        engine: Arc<NoticerEngine>,
     ) -> Self {
         Self {
             store,
             index_store,
-            reasoner,
+            engine,
         }
     }
 
-    /// Run a discovery cycle: fetch all L1 vectors, cluster them, and generate rules.
     pub fn run_discovery_cycle(&self) -> Result<()> {
-        let vectors = self
-            .index_store
-            .get_all_lens_vectors(&ambient_core::LensConfig::semantic())?;
-        if vectors.len() < 10 {
-            return Ok(());
-        }
+        // Build mock state for MVP trigger
+        let state = NoticerState {
+            last_run: None,
+            new_events_count: 500, // force trigger true for MVP testing
+        };
 
-        // Prepare data for clustering
-        let unit_ids: Vec<Uuid> = vectors.iter().map(|(id, _)| *id).collect();
-        let dim = vectors[0].1.len();
-        let mut data = Vec::with_capacity(vectors.len() * dim);
-        for (_, v) in &vectors {
-            data.extend_from_slice(v);
-        }
-
-        let array = Array2::from_shape_vec((vectors.len(), dim), data)
-            .map_err(|e| CoreError::Internal(format!("failed to shape clustering array: {e}")))?;
-
-        // DBSCAN: eps=0.5 (cosine-ish), min_samples=3
-        let mut model = Dbscan::new(0.5, 3, Euclidean::default());
-        let (clusters, _): (HashMap<usize, Vec<usize>>, _) = model.fit(&array, None);
-
-        // Group by cluster and generate rules if significant
-        for (_label, indices) in clusters {
-            if indices.len() >= 5 {
-                let cluster_ids: Vec<Uuid> = indices.iter().map(|&i| unit_ids[i]).collect();
-                self.formalize_cluster(cluster_ids)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn formalize_cluster(&self, unit_ids: Vec<Uuid>) -> Result<()> {
-        let mut notes = Vec::new();
-        for id in unit_ids.iter().take(10) {
-            if let Some(unit) = self.store.get_by_id(*id)? {
-                notes.push(unit);
-            }
-        }
-
-        let contents: Vec<String> = notes.iter().map(|n| n.content.clone()).collect();
-        let prompt = format!(
-            "Analyze these related knowledge units and derive a 'procedural rule' that encapsulates the behavior or topic. \
-            The rule should match similar future units. \
-            Units: \n---\n{}\n---\n\
-            Return a JSON object with: {{ \"summary\": \"...\", \"trigger_description\": \"...\", \"suggested_action_payload\": {{}} }}",
-            contents.join("\n---\n")
-        );
-
-        let response = self.reasoner.answer(&prompt, &notes)?;
-        // Parse response and save rule
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(&response) {
-            // Calculate centroid of the cluster for lens_intent
-            // (Omitted for brevity, using first unit's vector as proxy for now)
-            let lens_intent = self.index_store.get_all_lens_vectors(&ambient_core::LensConfig::semantic())? // Inefficient but works for MVP
-                .into_iter()
-                .find(|(id, _)| *id == unit_ids[0])
-                .map(|(_, v)| v)
-                .unwrap_or_else(|| vec![0.0; 768]);
-
-            let rule = ambient_core::ProceduralRule {
-                id: Uuid::new_v4(),
-                lens_intent,
-                pulse_mask: "any".to_string(), // MVP: match any pulse
-                threshold: 0.85,
-                action_payload: val["suggested_action_payload"].clone(),
-                created_at: Utc::now(),
-            };
-            self.store.save_rule(rule)?;
-        }
-
-        Ok(())
+        self.engine
+            .run(&state, self.store.as_ref(), self.index_store.as_ref())
     }
 }
 
@@ -1259,7 +1194,13 @@ mod tests {
         };
         store.snapshots.lock().unwrap().push((snapshot_id, state));
 
-        let predictor = ActionPredictor::new(store);
+        let engine = Arc::new(RuleEngine::new(
+            Arc::new(MvpPulseMatcher),
+            Arc::new(MvpIntentScorer),
+            Arc::new(MvpThresholdPolicy),
+            Arc::new(NoopRuleExecutor),
+        ));
+        let predictor = ActionPredictor::new(store, engine);
         let predictions = predictor.predict(1).unwrap();
         assert_eq!(predictions.len(), 1);
         assert_eq!(predictions[0].rule_id, rule_id);
@@ -1297,7 +1238,13 @@ mod tests {
             .unwrap()
             .push((Uuid::new_v4(), state));
 
-        let predictor = ActionPredictor::new(store);
+        let engine = Arc::new(RuleEngine::new(
+            Arc::new(MvpPulseMatcher),
+            Arc::new(MvpIntentScorer),
+            Arc::new(MvpThresholdPolicy),
+            Arc::new(NoopRuleExecutor),
+        ));
+        let predictor = ActionPredictor::new(store, engine);
         let predictions = predictor.predict(1).unwrap();
         assert_eq!(predictions.len(), 0);
     }

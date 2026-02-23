@@ -291,6 +291,19 @@ pub struct AmbientConfig {
     pub reasoning_api_key: Option<String>,
     pub embedding_model: String,
     pub completion_model: String,
+
+    // Noticer Pipeline Config
+    pub noticer_trigger: String,
+    pub noticer_selector: String,
+    pub noticer_clusterer: String,
+    pub noticer_synthesizer: String,
+    pub noticer_publisher: String,
+
+    // Rules Pipeline Config
+    pub rules_matcher: String,
+    pub rules_scorer: String,
+    pub rules_threshold: String,
+    pub rules_executor: String,
 }
 
 impl Default for AmbientConfig {
@@ -333,9 +346,21 @@ impl Default for AmbientConfig {
             reasoning_api_key: None,
             embedding_model: "nomic-embed-text".to_string(),
             completion_model: "llama3.2".to_string(),
+            noticer_trigger: "events_or_24h".to_string(),
+            noticer_selector: "mvp_lens".to_string(),
+            noticer_clusterer: "mvp_dbscan".to_string(),
+            noticer_synthesizer: "llm_json".to_string(),
+            noticer_publisher: "store_rule".to_string(),
+            rules_matcher: "exact_bitmask".to_string(),
+            rules_scorer: "cosine".to_string(),
+            rules_threshold: "dynamic".to_string(),
+            rules_executor: "noop".to_string(),
         }
     }
 }
+
+pub mod factory;
+pub use factory::*;
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 struct ConfigFile {
@@ -359,6 +384,10 @@ struct ConfigFile {
     daemon: DaemonConfig,
     #[serde(default)]
     reasoning: ReasoningConfig,
+    #[serde(default)]
+    noticer: NoticerConfig,
+    #[serde(default)]
+    rules: RulesConfig,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -492,6 +521,48 @@ impl Default for ReasoningConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+struct NoticerConfig {
+    trigger: String,
+    selector: String,
+    clusterer: String,
+    synthesizer: String,
+    publisher: String,
+}
+
+impl Default for NoticerConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            trigger: d.noticer_trigger,
+            selector: d.noticer_selector,
+            clusterer: d.noticer_clusterer,
+            synthesizer: d.noticer_synthesizer,
+            publisher: d.noticer_publisher,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct RulesConfig {
+    pulse_matcher: String,
+    intent_scorer: String,
+    threshold_policy: String,
+    executor: String,
+}
+
+impl Default for RulesConfig {
+    fn default() -> Self {
+        let d = AmbientConfig::default();
+        Self {
+            pulse_matcher: d.rules_matcher,
+            intent_scorer: d.rules_scorer,
+            threshold_policy: d.rules_threshold,
+            executor: d.rules_executor,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct CloudKitConfig {
     container: String,
     zone_name: String,
@@ -593,6 +664,15 @@ impl AmbientConfig {
             reasoning_api_key: parsed.reasoning.api_key,
             embedding_model: parsed.reasoning.embedding_model,
             completion_model: parsed.reasoning.completion_model,
+            noticer_trigger: parsed.noticer.trigger,
+            noticer_selector: parsed.noticer.selector,
+            noticer_clusterer: parsed.noticer.clusterer,
+            noticer_synthesizer: parsed.noticer.synthesizer,
+            noticer_publisher: parsed.noticer.publisher,
+            rules_matcher: parsed.rules.pulse_matcher,
+            rules_scorer: parsed.rules.intent_scorer,
+            rules_threshold: parsed.rules.threshold_policy,
+            rules_executor: parsed.rules.executor,
         })
     }
 }
@@ -801,6 +881,19 @@ ollama_url = "http://localhost:11434"
 [daemon]
 http_port = 7474
 auth_token = ""
+
+[noticer]
+trigger = "events_or_24h"
+selector = "mvp_lens"
+clusterer = "mvp_dbscan"
+synthesizer = "llm_json"
+publisher = "store_rule"
+
+[rules]
+pulse_matcher = "exact_bitmask"
+intent_scorer = "cosine"
+threshold_policy = "dynamic"
+executor = "noop"
 "#
 }
 
@@ -808,6 +901,7 @@ auth_token = ""
 pub struct HttpAppState {
     pub engine: Arc<dyn QueryEngine>,
     pub store: Arc<dyn KnowledgeStore>,
+    pub config: Arc<AmbientConfig>,
     pub auth_token: Option<String>,
     pub status_probe: Option<Arc<dyn DaemonStatusProbe>>,
     pub deep_link_focus: Arc<Mutex<Option<Uuid>>>,
@@ -952,10 +1046,12 @@ async fn http_query(
 
     if let Ok(ref mut units) = result {
         if let Some(first) = units.first_mut() {
-            let predictor = ambient_patterns::ActionPredictor::new(state.store.clone());
-            if let Ok(predictions) = predictor.predict(1) {
-                if !predictions.is_empty() {
-                    first.predicted_actions = Some(predictions);
+            if let Ok(engine) = factory::build_rule_engine(&state.config) {
+                let predictor = ambient_patterns::ActionPredictor::new(state.store.clone(), engine);
+                if let Ok(predictions) = predictor.predict(1) {
+                    if !predictions.is_empty() {
+                        first.predicted_actions = Some(predictions);
+                    }
                 }
             }
         }
@@ -978,9 +1074,13 @@ async fn http_predict(
         return resp;
     }
 
-    let predictor = ambient_patterns::ActionPredictor::new(state.store.clone());
-    let result = predictor.predict(req.limit);
-    map_result(result)
+    if let Ok(engine) = factory::build_rule_engine(&state.config) {
+        let predictor = ambient_patterns::ActionPredictor::new(state.store.clone(), engine);
+        let result = predictor.predict(req.limit);
+        map_result(result)
+    } else {
+        map_result::<Vec<ambient_core::PredictedAction>>(Ok(Vec::new())) // Default to empty
+    }
 }
 
 async fn http_ask(
@@ -1430,6 +1530,7 @@ mod tests {
         let app = build_router(HttpAppState {
             engine,
             store,
+            config: std::sync::Arc::new(AmbientConfig::default()),
             auth_token: None,
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
@@ -1463,6 +1564,7 @@ mod tests {
         let app = build_router(HttpAppState {
             engine,
             store,
+            config: std::sync::Arc::new(AmbientConfig::default()),
             auth_token: Some("secret".to_string()),
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
@@ -1495,6 +1597,7 @@ mod tests {
         let app = build_router(HttpAppState {
             engine,
             store,
+            config: std::sync::Arc::new(AmbientConfig::default()),
             auth_token: None,
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
@@ -1564,6 +1667,7 @@ mod tests {
         let app = build_router(HttpAppState {
             engine,
             store,
+            config: std::sync::Arc::new(AmbientConfig::default()),
             auth_token: None,
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
@@ -1589,6 +1693,7 @@ mod tests {
         let app = build_router(HttpAppState {
             engine,
             store,
+            config: std::sync::Arc::new(AmbientConfig::default()),
             auth_token: None,
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
@@ -1657,6 +1762,7 @@ mod tests {
         let app = build_router(HttpAppState {
             engine,
             store,
+            config: std::sync::Arc::new(AmbientConfig::default()),
             auth_token: None,
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
