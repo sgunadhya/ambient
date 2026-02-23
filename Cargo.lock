@@ -84,6 +84,7 @@ dependencies = [
  "tokio",
  "toml",
  "tower",
+ "tower-http",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -189,6 +190,7 @@ dependencies = [
  "petal-neighbors",
  "serde",
  "serde_json",
+ "tracing",
  "uuid",
 ]
 
@@ -200,6 +202,7 @@ dependencies = [
  "ambient-reasoning",
  "ambient-store",
  "chrono",
+ "tracing",
 ]
 
 [[package]]
@@ -4317,6 +4320,7 @@ dependencies = [
  "tower",
  "tower-layer",
  "tower-service",
+ "tracing",
 ]
 
 [[package]]

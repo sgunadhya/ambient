@@ -13,7 +13,7 @@ use rig::client::{CompletionClient, EmbeddingsClient, Nothing};
 use rig::completion::Prompt;
 use rig::embeddings::EmbeddingModel as RigEmbeddingModel;
 use rig::providers::{ollama, openai};
-use tracing::{debug, info};
+use tracing::{debug, error, info, instrument, warn};
 
 pub struct RigReasoningEngine {
     pub backend: ReasoningBackend,
@@ -117,10 +117,12 @@ impl RigReasoningEngine {
 }
 
 impl ReasoningEngine for RigReasoningEngine {
+    #[instrument(skip(self))]
     fn embed(&self, text: &str) -> Result<Vec<f32>> {
         self.embed_with_model(text, &self.embedding_model_name)
     }
 
+    #[instrument(skip(self))]
     fn embed_with_model(&self, text: &str, model: &str) -> Result<Vec<f32>> {
         debug!(
             text_len = text.len(),
@@ -187,6 +189,7 @@ impl ReasoningEngine for RigReasoningEngine {
             .map_err(|_| CoreError::Internal("embedding timed out after 30s".to_string()))?
     }
 
+    #[instrument(skip(self, context))]
     fn answer(&self, question: &str, context: &[KnowledgeUnit]) -> Result<String> {
         info!(
             question = question,
@@ -287,7 +290,7 @@ impl LensConsumer {
             let res = worker.consumer.poll(10, |_, entry| {
                 if let EventLogEntry::Raw(raw) = entry {
                     if let RawPayload::KnowledgeUnitSync { unit, .. } = raw.payload {
-                        debug!(unit_id = %unit.id, "processing decoupled multi-lens indexing job");
+                        info!(unit_id = %unit.id, "processing decoupled multi-lens indexing job");
 
                         // L1, L2, L5: Embeddings
                         let rt = tokio::runtime::Builder::new_current_thread()
@@ -317,7 +320,7 @@ impl LensConsumer {
             });
 
             if let Err(e) = res {
-                debug!("lens consumer poll error: {e}");
+                error!(error = %e, "lens consumer poll error");
                 thread::sleep(Duration::from_millis(1000));
             } else {
                 thread::sleep(Duration::from_millis(250));

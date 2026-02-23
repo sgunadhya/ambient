@@ -1011,6 +1011,7 @@ pub fn build_router(state: HttpAppState) -> Router {
         .route("/transport/:id/push", post(http_transport_push))
         .route("/open/unit/:id", post(http_open_unit))
         .route("/open/focus", get(http_get_focus))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 

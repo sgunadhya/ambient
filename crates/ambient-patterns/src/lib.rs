@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use tracing::error;
 
 use ambient_core::{
     CognitiveState, CoreError, FeedbackEvent, FeedbackSignal, KnowledgeStore, KnowledgeUnit,
@@ -576,7 +577,7 @@ impl PatternScheduler {
 
             // Phase 4: Noticer Discovery Cycle
             if let Err(e) = self.noticer.run_discovery_cycle() {
-                eprintln!("Noticer discovery cycle failed: {e}");
+                error!(error = %e, "Noticer discovery cycle failed");
             }
 
             // Phase 3/4: Temporal Recalculation

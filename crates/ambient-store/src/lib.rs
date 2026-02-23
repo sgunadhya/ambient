@@ -10,6 +10,7 @@ use ambient_core::{
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
 use serde_json::Value;
+use tracing::{error, info, instrument};
 use uuid::Uuid;
 
 const METRIC_CONTEXT_SWITCH_RATE: &str = "context_switch_rate";
@@ -98,7 +99,7 @@ impl CozoStore {
                 // Ignore "conflicts with an existing one" which is normal if table exists
                 let err_str = e.to_string();
                 if !err_str.contains("conflicts with an existing one") {
-                    println!("Failed to run script: {}. Error: {}", cmd, e);
+                    error!("Failed to run script: {}. Error: {}", cmd, e);
                 }
             }
         }
@@ -153,7 +154,7 @@ impl CozoStore {
         {
             let err_str = e.to_string();
             if !err_str.contains("conflicts with an existing one") {
-                eprintln!("FTS schema init error: {}", e);
+                error!("FTS schema init error: {}", e);
             }
         }
     }
@@ -192,7 +193,7 @@ impl CozoStore {
             .cozo
             .run_script(script, params, ScriptMutability::Mutable)
         {
-            eprintln!("Error in cozo_put_note Datalog: {}", e);
+            error!("Error in cozo_put_note Datalog: {}", e);
         }
     }
 
@@ -822,6 +823,7 @@ impl CozoStore {
 }
 
 impl KnowledgeStore for CozoStore {
+    #[instrument(skip(self, unit), fields(unit_id = %unit.id))]
     fn upsert(&self, unit: KnowledgeUnit) -> Result<()> {
         // ── Deduplication ────────────────────────────────────────────────────
         {
@@ -902,6 +904,7 @@ impl KnowledgeStore for CozoStore {
         Ok(())
     }
 
+    #[instrument(skip(self, query_vec))]
     fn search_semantic(&self, query_vec: &[f32], k: usize) -> Result<Vec<KnowledgeUnit>> {
         if query_vec.is_empty() {
             return Ok(Vec::new());
@@ -947,6 +950,7 @@ impl KnowledgeStore for CozoStore {
         }
     }
 
+    #[instrument(skip(self))]
     fn search_fulltext(&self, query: &str) -> Result<Vec<KnowledgeUnit>> {
         if query.is_empty() {
             let script = r#"
@@ -977,7 +981,8 @@ impl KnowledgeStore for CozoStore {
         let mut out = Vec::new();
         if let Ok(result) = self
             .cozo
-            .run_script(script, params, ScriptMutability::Immutable) {
+            .run_script(script, params, ScriptMutability::Immutable)
+        {
             for row in result.rows {
                 if let Some(unit) = self.row_to_knowledge_unit(&row) {
                     out.push(unit);
@@ -987,6 +992,7 @@ impl KnowledgeStore for CozoStore {
         Ok(out)
     }
 
+    #[instrument(skip(self))]
     fn related(&self, id: Uuid, depth: usize) -> Result<Vec<KnowledgeUnit>> {
         if depth == 0 {
             return Ok(Vec::new());
@@ -1054,6 +1060,7 @@ impl KnowledgeStore for CozoStore {
         Ok(out)
     }
 
+    #[instrument(skip(self))]
     fn get_by_id(&self, id: Uuid) -> Result<Option<KnowledgeUnit>> {
         let mut params = BTreeMap::new();
         params.insert("id".to_string(), DataValue::from(id.to_string()));
@@ -1070,6 +1077,7 @@ impl KnowledgeStore for CozoStore {
             .and_then(|row| self.row_to_knowledge_unit(row)))
     }
 
+    #[instrument(skip(self))]
     fn record_pulse(&self, event: PulseEvent) -> Result<()> {
         let record = Self::metric_record_for_event(event);
         self.pulse_storage
@@ -1077,6 +1085,7 @@ impl KnowledgeStore for CozoStore {
             .map_err(|e| CoreError::Internal(format!("tsink append failed: {e}")))
     }
 
+    #[instrument(skip(self))]
     fn pulse_window(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<PulseEvent>> {
         let mut events: Vec<PulseEvent> = self
             .pulse_storage
@@ -1089,6 +1098,7 @@ impl KnowledgeStore for CozoStore {
         Ok(events)
     }
 
+    #[instrument(skip(self))]
     fn unit_with_context(
         &self,
         id: Uuid,
@@ -1106,6 +1116,7 @@ impl KnowledgeStore for CozoStore {
         Ok(Some((unit, pulse, state)))
     }
 
+    #[instrument(skip(self))]
     fn unit_with_context_fast(&self, id: Uuid) -> Result<Option<(KnowledgeUnit, CognitiveState)>> {
         let Some(unit) = self.get_by_id(id)? else {
             return Ok(None);
@@ -1194,6 +1205,7 @@ impl KnowledgeStore for CozoStore {
         self.unit_with_context(id, window_secs)
     }
 
+    #[instrument(skip(self))]
     fn record_feedback(&self, event: FeedbackEvent) -> Result<()> {
         self.cozo_record_feedback(&event);
         Ok(())
@@ -1815,7 +1827,7 @@ mod tests {
             .cozo
             .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)
             .expect("rels");
-        println!("Available relations: {:?}", rels);
+        info!("Available relations: {:?}", rels);
         assert_eq!(store.feedback_score(id_a).expect("score"), 0.5);
 
         // 2. Positive signal (Acted On: +1)

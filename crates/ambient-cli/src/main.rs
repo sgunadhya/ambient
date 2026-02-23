@@ -253,7 +253,14 @@ fn main() -> ExitCode {
 
 fn run() -> Result<(), String> {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "ambient=info,tower_http=info".into()),
+        )
+        .with_target(false)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true)
         .init();
 
     let cli = Cli::parse();

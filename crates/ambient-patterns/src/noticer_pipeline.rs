@@ -4,6 +4,7 @@ use ambient_core::{
     Candidate, CandidateSelector, Cluster, Clusterer, DiscoveryTrigger, KnowledgeStore,
     LensIndexStore, NoticerState, Result, RulePublisher, RuleSynthesizer,
 };
+use tracing::{info, instrument, warn};
 
 /// Orchestrates the Noticer Pipeline using interchangeable components.
 pub struct NoticerEngine {
@@ -32,6 +33,7 @@ impl NoticerEngine {
     }
 
     /// Run the Noticer pipeline.
+    #[instrument(skip(self, store, index))]
     pub fn run(
         &self,
         state: &NoticerState,
@@ -39,14 +41,20 @@ impl NoticerEngine {
         index: &dyn LensIndexStore,
     ) -> Result<()> {
         if !self.trigger.should_run(state) {
+            info!("Discovery trigger conditions not met, skipping run");
             return Ok(());
         }
 
         // 1. Select Candidates
         let candidates = self.selector.select(store, index)?;
         if candidates.is_empty() {
+            info!("No candidates selected, skipping run");
             return Ok(());
         }
+        info!(
+            candidates_count = candidates.len(),
+            "Selected candidates for discovery"
+        );
 
         // 2. Extract vectors to cluster
         let vecs: Vec<Vec<f32>> = candidates.iter().map(|c| c.vector.clone()).collect();
@@ -54,8 +62,10 @@ impl NoticerEngine {
 
         // 3. Cluster
         let clusters = self.clusterer.cluster(&vecs)?;
+        info!(clusters_count = clusters.len(), "Clustered candidates");
 
         // 4. Synthesize & Publish
+        let mut published_count = 0;
         for mut cls in clusters {
             // Re-map dense indices back to Uuids
             cls.candidate_ids = cls
@@ -73,10 +83,23 @@ impl NoticerEngine {
                 }
             }
 
-            if let Ok(rule) = self.synthesizer.synthesize(&cls, &units) {
-                let _ = self.publisher.publish(rule, store);
+            match self.synthesizer.synthesize(&cls, &units) {
+                Ok(rule) => {
+                    if self.publisher.publish(rule.clone(), store).is_ok() {
+                        info!(rule_id = %rule.id, "Synthesized and published new procedural rule");
+                        published_count += 1;
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to synthesize rule from cluster");
+                }
             }
         }
+
+        info!(
+            published_rules_count = published_count,
+            "Noticer discovery cycle complete"
+        );
 
         Ok(())
     }
@@ -278,7 +301,9 @@ impl RuleSynthesizer for SpecRuleSynthesizer {
         _units: &[ambient_core::KnowledgeUnit],
     ) -> Result<ambient_core::ProceduralRule> {
         // Generates robust queries and JSON objects using multi-shot prompts
-        Err(ambient_core::CoreError::Internal("Not implemented".to_string()))
+        Err(ambient_core::CoreError::Internal(
+            "Not implemented".to_string(),
+        ))
     }
 }
 

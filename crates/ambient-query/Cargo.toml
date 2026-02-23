@@ -8,3 +8,4 @@ ambient-core = { path = "../ambient-core" }
 ambient-store = { path = "../ambient-store" }
 ambient-reasoning = { path = "../ambient-reasoning" }
 chrono = "0.4.43"
+tracing = "0.1"

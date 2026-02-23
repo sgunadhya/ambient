@@ -7,6 +7,7 @@ use ambient_core::{
 };
 use ambient_store::CozoStore;
 use chrono::{Datelike, Timelike};
+use tracing::{info, instrument, warn};
 
 pub struct VectorLensRetriever {
     config: LensConfig,
@@ -33,6 +34,7 @@ impl LensRetriever for VectorLensRetriever {
         Some(&self.config)
     }
 
+    #[instrument(skip(self, request))]
     fn retrieve(&self, request: &QueryRequest) -> Result<Vec<Uuid>> {
         let vec = self
             .reasoning
@@ -57,6 +59,7 @@ impl LensRetriever for FtsRetriever {
         None
     }
 
+    #[instrument(skip(self, request))]
     fn retrieve(&self, request: &QueryRequest) -> Result<Vec<Uuid>> {
         let units = self.store.search_fulltext(&request.text)?;
         Ok(units.into_iter().map(|u| u.id).collect())
@@ -135,8 +138,10 @@ impl AmbientQueryEngine {
         )
     }
 
+    #[instrument(skip(self, req))]
     pub fn answer_internal(&self, question: &str, req: &QueryRequest) -> Result<Option<String>> {
         let Some(reasoning) = &self.reasoning else {
+            warn!("Reasoning engine unavailable for answer_internal");
             return Ok(None);
         };
 
@@ -149,23 +154,38 @@ impl AmbientQueryEngine {
 }
 
 impl QueryEngine for AmbientQueryEngine {
+    #[instrument(skip(self, req), fields(text = %req.text, k = req.k))]
     fn query(&self, req: QueryRequest) -> Result<Vec<QueryResult>> {
         let mut rank_lists = Vec::new();
 
         for retriever in &self.retrievers {
-            if retriever.config().is_some() && !self.semantic_allowed() {
+            let is_fts = retriever.config().is_none();
+            let retriever_type = if is_fts { "fts" } else { "vector" };
+
+            if !is_fts && !self.semantic_allowed() {
                 continue; // Skip vector searches if semantic intelligence is disabled
             }
 
-            if let Ok(ids) = retriever.retrieve(&req) {
-                if !ids.is_empty() {
-                    rank_lists.push(ids);
+            match retriever.retrieve(&req) {
+                Ok(ids) => {
+                    info!(
+                        retriever = retriever_type,
+                        hits = ids.len(),
+                        "Retriever yielded candidates"
+                    );
+                    if !ids.is_empty() {
+                        rank_lists.push(ids);
+                    }
+                }
+                Err(e) => {
+                    warn!(retriever = retriever_type, error = %e, "Retriever failed to execute");
                 }
             }
         }
 
         // 4. Fusion via RRF
         let fused = self.rrf(rank_lists, 60.0);
+        info!(fused_candidates = fused.len(), "RRF fusion completed");
         if fused.is_empty() {
             return Err(CoreError::NotFound("no matching units found".to_string()));
         }
@@ -225,6 +245,7 @@ impl QueryEngine for AmbientQueryEngine {
                 temporal_boost += profile.recency_weight * 0.2; // up to 20% boost for recency
 
                 score *= temporal_boost;
+                info!(unit_id = %id, temporal_boost, final_score = score, "Temporal rerank applied");
             }
 
             out.push(QueryResult {
