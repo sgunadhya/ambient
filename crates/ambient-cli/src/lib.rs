@@ -720,6 +720,7 @@ pub fn capability_statuses(
 
 pub fn submit_checkin(
     store: &dyn KnowledgeStore,
+    provider: Option<&dyn ambient_core::StreamProvider>,
     energy: u8,
     mood: u8,
     note: Option<String>,
@@ -761,6 +762,20 @@ pub fn submit_checkin(
     };
 
     store.upsert(unit.clone())?;
+
+    if let Some(p) = provider {
+        let _ = p.append_raw(ambient_core::RawEvent {
+            timestamp: observed_at,
+            source: SourceId::new("self_report"),
+            payload: ambient_core::RawPayload::SelfReport {
+                energy,
+                mood,
+                note: note.clone(),
+                reported_at: observed_at,
+            },
+        });
+    }
+
     store.record_pulse(PulseEvent {
         timestamp: observed_at,
         signal: PulseSignal::EnergyLevel { score: energy },
@@ -907,6 +922,7 @@ pub struct HttpAppState {
     pub deep_link_focus: Arc<Mutex<Option<Uuid>>>,
     pub transport_registry: Option<Arc<TransportRegistry>>,
     pub feedback_recorder: Option<Arc<ambient_patterns::ImplicitFeedbackRecorder>>,
+    pub provider: Option<Arc<dyn ambient_core::StreamProvider>>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -1235,6 +1251,7 @@ async fn http_checkin(
     }
     map_result(submit_checkin(
         state.store.as_ref(),
+        state.provider.as_deref(),
         req.energy,
         req.mood,
         req.note,
@@ -1469,8 +1486,8 @@ mod tests {
     fn checkin_writes_unit_and_pulse() {
         let store = MockKnowledgeStore::default();
 
-        let unit =
-            submit_checkin(&store, 4, 3, Some("deep work".to_string())).expect("checkin works");
+        let unit = submit_checkin(&store, None, 4, 3, Some("deep work".to_string()))
+            .expect("checkin works");
 
         assert_eq!(unit.source.0, "self_report");
         assert!(unit.content.contains("Energy: 4/5"));
@@ -1536,6 +1553,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: None,
+            provider: None,
             feedback_recorder: None,
         });
 
@@ -1570,6 +1588,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: None,
+            provider: None,
             feedback_recorder: None,
         });
 
@@ -1603,6 +1622,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(Arc::new(crate::TransportRegistry::default())),
+            provider: None,
             feedback_recorder: None,
         });
 
@@ -1673,6 +1693,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(registry),
+            provider: None,
             feedback_recorder: None,
         });
 
@@ -1699,6 +1720,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(Arc::new(crate::TransportRegistry::default())),
+            provider: None,
             feedback_recorder: None,
         });
 
@@ -1768,6 +1790,7 @@ mod tests {
             status_probe: None,
             deep_link_focus: Arc::new(Mutex::new(None)),
             transport_registry: Some(registry),
+            provider: None,
             feedback_recorder: None,
         });
 

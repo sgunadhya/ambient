@@ -91,6 +91,7 @@ fn phase3_query_engine_ranking_and_fallback() {
         status_probe: None,
         deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
         transport_registry: None,
+        provider: None,
         feedback_recorder: None,
     });
     let request = Request::builder()

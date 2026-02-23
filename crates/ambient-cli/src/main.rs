@@ -252,15 +252,35 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<(), String> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+    let log_dir = default_log_dir()?;
+    if !log_dir.exists() {
+        std::fs::create_dir_all(&log_dir).map_err(|e| format!("failed to create log dir: {e}"))?;
+    }
+    let file_appender = tracing_appender::rolling::daily(log_dir, "ambient.log");
+    let (non_blocking, _guard) = tracing_appender::non_blocking(file_appender);
+
+    tracing_subscriber::registry()
+        .with(
+            EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "ambient=info,tower_http=info".into()),
         )
-        .with_target(false)
-        .with_thread_ids(true)
-        .with_file(true)
-        .with_line_number(true)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true),
+        )
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(non_blocking)
+                .with_target(false)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true),
+        )
         .init();
 
     let cli = Cli::parse();
@@ -467,7 +487,7 @@ fn run() -> Result<(), String> {
             {
                 let _guard = runtime.enter();
                 transport_registry
-                    .start_all(stream_provider)
+                    .start_all(stream_provider.clone())
                     .map_err(|e| format!("failed to start transport registry: {e}"))?;
             }
             let run_result = runtime.block_on(run_http_server(
@@ -487,6 +507,7 @@ fn run() -> Result<(), String> {
                     })),
                     deep_link_focus: Arc::new(std::sync::Mutex::new(None)),
                     transport_registry: Some(transport_registry.clone()),
+                    provider: Some(stream_provider.clone()),
                     feedback_recorder: Some(feedback_recorder),
                 },
             ));
@@ -635,6 +656,11 @@ fn default_triggers_path() -> Result<PathBuf, String> {
 fn default_report_dir() -> Result<PathBuf, String> {
     let home = env::var("HOME").map_err(|e| format!("failed to resolve HOME: {e}"))?;
     Ok(PathBuf::from(home).join(".ambient").join("reports"))
+}
+
+fn default_log_dir() -> Result<PathBuf, String> {
+    let home = env::var("HOME").map_err(|e| format!("failed to resolve HOME: {e}"))?;
+    Ok(PathBuf::from(home).join(".ambient").join("logs"))
 }
 
 fn default_daemon_pid_path() -> Result<PathBuf, String> {
