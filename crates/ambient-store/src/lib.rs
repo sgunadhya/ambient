@@ -1,3 +1,5 @@
+pub mod lancedb_store;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -10,8 +12,10 @@ use ambient_core::{
 use chrono::{DateTime, Datelike, Timelike, Utc};
 use cozo::{DataValue, DbInstance, ScriptMutability};
 use serde_json::Value;
-use tracing::{error, info, instrument};
+use tracing::{error, instrument};
 use uuid::Uuid;
+
+pub use lancedb_store::LanceDbStore;
 
 const METRIC_CONTEXT_SWITCH_RATE: &str = "context_switch_rate";
 const METRIC_ACTIVE_APP: &str = "active_app";
@@ -1651,6 +1655,7 @@ mod tests {
     use std::collections::HashMap;
 
     use ambient_core::{KnowledgeStore, KnowledgeUnit, SourceId};
+    use tracing::info;
 
     use super::*;
 

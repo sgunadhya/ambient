@@ -24,3 +24,4 @@ members = [
 
 [patch.crates-io]
 graph_builder = { path = "vendor/graph_builder" }
+arrow-arith = { path = "vendor/arrow-arith-53.4.0" }

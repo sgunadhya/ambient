@@ -5,7 +5,7 @@ use ambient_core::{
     LensIndexStore, LensRetriever, QueryEngine, QueryRequest, QueryResult, ReasoningEngine, Result,
     Uuid,
 };
-use ambient_store::CozoStore;
+use ambient_store::{CozoStore, LanceDbStore};
 use chrono::{Datelike, Timelike};
 use tracing::{info, instrument, warn};
 
@@ -297,7 +297,7 @@ pub fn build_runtime_components_with_weights(
 ) -> Result<RuntimeComponents> {
     let cozo = Arc::new(CozoStore::new()?);
     let store: Arc<dyn KnowledgeStore> = cozo.clone();
-    let index_store: Arc<dyn LensIndexStore> = cozo;
+    let index_store: Arc<dyn LensIndexStore> = Arc::new(LanceDbStore::new()?);
 
     let mut retrievers: Vec<Arc<dyn LensRetriever>> =
         vec![Arc::new(FtsRetriever::new(store.clone()))];
